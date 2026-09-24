@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -100,8 +101,9 @@ func TestRunInjectsAndRedacts(t *testing.T) {
 func TestRunInjectsIntoChild(t *testing.T) {
 	seedVault(t)
 	outFile := filepath.Join(t.TempDir(), "child.txt")
+	command, args := writeEnvCommand(outFile)
 	if _, err := captureStdout(t, func() error {
-		return run([]string{"run", "my-api/staging", "--", "sh", "-c", "printf %s \"$API_KEY\" > " + outFile})
+		return run(append([]string{"run", "my-api/staging", "--", command}, args...))
 	}); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -109,9 +111,16 @@ func TestRunInjectsIntoChild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read child output: %v", err)
 	}
-	if string(got) != "sk-cli-abcdef" {
+	if strings.TrimSpace(string(got)) != "sk-cli-abcdef" {
 		t.Fatalf("child env = %q, want secret value", got)
 	}
+}
+
+func writeEnvCommand(path string) (string, []string) {
+	if runtime.GOOS == "windows" {
+		return "cmd", []string{"/c", `echo %API_KEY%>"` + path + `"`}
+	}
+	return "sh", []string{"-c", `printf %s "$API_KEY" > "$1"`, "sh", path}
 }
 
 func TestRunPropagatesExitCode(t *testing.T) {
