@@ -1,0 +1,121 @@
+package backup
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"testing"
+
+	"github.com/fernandoris/blindenv/pkg/crypto"
+	"github.com/fernandoris/blindenv/pkg/db"
+)
+
+func newStore(t *testing.T) *db.Store {
+	t.Helper()
+	key, err := crypto.NewSalt(crypto.KeySize)
+	if err != nil {
+		t.Fatalf("key: %v", err)
+	}
+	store, err := db.Open(filepath.Join(t.TempDir(), "vault.db"), key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+func seed(t *testing.T, store *db.Store) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := store.CreateProject(ctx, "my-api"); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	if err := store.SetAllowExecute(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowExecute: %v", err)
+	}
+	if _, err := store.CreateEnvironment(ctx, "my-api", "staging"); err != nil {
+		t.Fatalf("CreateEnvironment: %v", err)
+	}
+	if _, err := store.PutSecret(ctx, "my-api", "", "REGION", "eu-west-1"); err != nil {
+		t.Fatalf("PutSecret: %v", err)
+	}
+	if _, err := store.PutSecret(ctx, "my-api", "staging", "API_KEY", "sk-round-trip-123"); err != nil {
+		t.Fatalf("PutSecret: %v", err)
+	}
+}
+
+func TestExportImportRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	source := newStore(t)
+	seed(t, source)
+
+	blob, err := Export(ctx, source, "backup-pass")
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+
+	target := newStore(t)
+	if err := Import(ctx, target, "backup-pass", blob); err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+
+	got, err := target.Resolve(ctx, "my-api", "staging")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got["API_KEY"] != "sk-round-trip-123" || got["REGION"] != "eu-west-1" {
+		t.Fatalf("restored values = %v", got)
+	}
+	p, err := target.GetProject(ctx, "my-api")
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	if !p.AllowExecute {
+		t.Fatal("allow_execute not restored")
+	}
+}
+
+func TestImportWrongPassphraseDoesNotMutate(t *testing.T) {
+	ctx := context.Background()
+	source := newStore(t)
+	seed(t, source)
+	blob, err := Export(ctx, source, "right-pass")
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+
+	target := newStore(t)
+	if err := Import(ctx, target, "wrong-pass", blob); !errors.Is(err, ErrWrongPassphrase) {
+		t.Fatalf("err = %v, want ErrWrongPassphrase", err)
+	}
+	projects, err := target.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("ListProjects: %v", err)
+	}
+	if len(projects) != 0 {
+		t.Fatalf("target mutated: %v", projects)
+	}
+}
+
+func TestImportUnrecognized(t *testing.T) {
+	target := newStore(t)
+	if err := Import(context.Background(), target, "x", []byte("not a backup")); !errors.Is(err, ErrUnrecognized) {
+		t.Fatalf("err = %v, want ErrUnrecognized", err)
+	}
+}
+
+func TestImportDuplicateProject(t *testing.T) {
+	ctx := context.Background()
+	source := newStore(t)
+	seed(t, source)
+	blob, err := Export(ctx, source, "pass")
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+
+	target := newStore(t)
+	seed(t, target)
+	if err := Import(ctx, target, "pass", blob); err == nil {
+		t.Fatal("expected error importing into a vault that already has the project")
+	}
+}

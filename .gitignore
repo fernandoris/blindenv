@@ -1,0 +1,13 @@
+# Build output
+/blindenv
+/blindenv.exe
+
+# Local vaults and backups
+*.db
+*.db-shm
+*.db-wal
+*.salt
+*.bin
+
+# Node tooling for the Tailwind build
+node_modules/
