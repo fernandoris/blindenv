@@ -1,19 +1,4 @@
-# mcp-server Specification
-
-## Purpose
-
-Exposes the vault to AI agents through the Model Context Protocol, letting them use and reference dev/pre-prod secrets without the values entering the model context window.
-
-## Requirements
-
-### Requirement: stdio transport with reserved stdout
-
-The MCP server SHALL communicate over `stdio` using JSON-RPC. The process MUST NOT write anything to stdout outside the protocol stream; logs MUST go to stderr or the audit log.
-
-#### Scenario: Startup without corrupting the protocol
-
-- **WHEN** the MCP server starts and emits log messages
-- **THEN** logs are written to stderr and stdout contains only MCP protocol messages
+## MODIFIED Requirements
 
 ### Requirement: Tool list_secret_keys
 
@@ -33,34 +18,6 @@ The Tool SHALL return only the NAMES of the effective keys for the resolved proj
 
 - **WHEN** a global key is defined and the model queries any project and environment
 - **THEN** the response includes that key name
-
-### Requirement: Tool get_context
-
-The Tool SHALL return execution context without secrets: operating system, architecture, shell hint, active project and environment, and the names of available keys.
-
-#### Scenario: Context without values
-
-- **WHEN** the model invokes `get_context`
-- **THEN** the response includes the operating system, the project and environment, and the key names, but no value
-
-### Requirement: Tool proxy_http_request
-
-The Tool SHALL perform HTTP requests substituting `{{SECRET_NAME}}` tags in URL, headers and body inside BlindEnv, using the secrets of the resolved project and environment.
-
-#### Scenario: Substitution in a header
-
-- **WHEN** a header contains `{{API_KEY}}`
-- **THEN** the outgoing request sends the real value and the model never receives it
-
-#### Scenario: JSON body with quotes
-
-- **WHEN** a secret value contains special characters and is substituted into a JSON body
-- **THEN** the resulting body remains valid JSON
-
-#### Scenario: Cross-host redirect
-
-- **WHEN** a response redirects to a different host
-- **THEN** the system does not forward secret-bearing headers to the new host
 
 ### Requirement: Tool execute_with_secrets
 
@@ -91,20 +48,6 @@ The Tool SHALL run a local subprocess injecting the effective secrets of the res
 - **WHEN** the model invokes the Tool with a separate command and arguments
 - **THEN** the system runs the command directly without interpreting it through a shell
 
-### Requirement: Context pinned in configuration with override
-
-The server SHALL take the project and environment from the MCP client configuration when the Tool does not receive them, and SHALL allow overriding them per call when provided.
-
-#### Scenario: Using the pinned context
-
-- **WHEN** the model invokes a Tool without specifying project or environment
-- **THEN** the system uses the project and environment pinned in the configuration
-
-#### Scenario: Per-call override
-
-- **WHEN** the model invokes a Tool specifying an environment different from the pinned one
-- **THEN** the system uses the environment given in the call
-
 ### Requirement: Audit without values
 
 The server SHALL log every Tool invocation with timestamp, project, environment, Tool name, NAMES of the keys used and the scope each key resolved from, command when applicable, exit code and redaction count. The log MUST NOT contain secret values.
@@ -118,12 +61,3 @@ The server SHALL log every Tool invocation with timestamp, project, environment,
 
 - **WHEN** a key used by a Tool resolved from a shared scope
 - **THEN** the audit entry records that scope as the source of the key
-
-### Requirement: Errors without values
-
-Error messages returned to the model MUST NOT contain secret values.
-
-#### Scenario: Command failure
-
-- **WHEN** a command fails and its error output contained a secret value
-- **THEN** the error returned to the model contains the redaction marker instead of the value

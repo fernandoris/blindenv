@@ -2,14 +2,23 @@ package db
 
 import "time"
 
-// Scope identifies where a secret is defined.
+// Scope identifies where a secret is defined, from most to least specific:
+// project + environment, project-global, environment-global (shared across
+// projects) and global (shared across projects and environments).
 type Scope string
 
 const (
-	// ScopeGlobal marks a secret that applies to every environment.
+	// ScopeGlobal marks a secret that applies to every project and environment.
 	ScopeGlobal Scope = "global"
-	// ScopeEnvironment marks a secret defined for a specific environment.
-	ScopeEnvironment Scope = "environment"
+	// ScopeSharedEnvironment marks a secret shared by every project that uses
+	// the named environment.
+	ScopeSharedEnvironment Scope = "environment"
+	// ScopeProject marks a secret that applies to every environment of one
+	// project.
+	ScopeProject Scope = "project"
+	// ScopeProjectEnvironment marks a secret defined for one environment of one
+	// project.
+	ScopeProjectEnvironment Scope = "project_environment"
 )
 
 // Project is a named container of environments and secrets.
@@ -33,8 +42,9 @@ type SecretInfo struct {
 	Key         string
 	Scope       Scope
 	Environment string
-	// Overrides is true when an environment secret shadows a global one.
-	Overrides bool
+	// Overrides lists the broader scopes this definition shadows, most
+	// specific first.
+	Overrides []Scope
 }
 
 // AuditEntry records a single MCP tool invocation. It never contains secret
@@ -47,7 +57,10 @@ type AuditEntry struct {
 	Environment string
 	Tool        string
 	KeyNames    []string
-	Command     string
-	ExitCode    *int
-	Redactions  int
+	// KeyScopes records the scope each key in KeyNames resolved from, in the
+	// same order.
+	KeyScopes  []Scope
+	Command    string
+	ExitCode   *int
+	Redactions int
 }

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -87,6 +88,7 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("/api/audit", s.sec(s.handleAudit))
 	mux.HandleFunc("/api/projects", s.sec(s.handleProjects))
 	mux.HandleFunc("/api/projects/", s.sec(s.handleProjectSub))
+	mux.HandleFunc("/api/shared/", s.sec(s.handleShared))
 	mux.HandleFunc("/api/export", s.sec(s.handleExport))
 	mux.HandleFunc("/api/import", s.sec(s.handleImport))
 	return mux
@@ -175,15 +177,22 @@ func (s *server) handleAsset(name, contentType string) http.HandlerFunc {
 // --- views ---
 
 type secretView struct {
+	Key         string   `json:"key"`
+	Scope       string   `json:"scope"`
+	Environment string   `json:"environment,omitempty"`
+	Overrides   []string `json:"overrides,omitempty"`
+}
+
+type effectiveView struct {
 	Key         string `json:"key"`
 	Scope       string `json:"scope"`
-	Environment string `json:"environment"`
-	Overrides   bool   `json:"overrides"`
+	Environment string `json:"environment,omitempty"`
 }
 
 type envView struct {
-	Name    string       `json:"name"`
-	Secrets []secretView `json:"secrets"`
+	Name      string          `json:"name"`
+	Secrets   []secretView    `json:"secrets"`
+	Effective []effectiveView `json:"effective"`
 }
 
 type projectView struct {
@@ -193,11 +202,34 @@ type projectView struct {
 	Environments []envView    `json:"environments"`
 }
 
+type sharedEnvView struct {
+	Name    string       `json:"name"`
+	Secrets []secretView `json:"secrets"`
+}
+
+type sharedView struct {
+	Global       []secretView    `json:"global"`
+	Environments []sharedEnvView `json:"environments"`
+}
+
 func toSecretViews(in []db.SecretInfo) []secretView {
 	out := make([]secretView, 0, len(in))
 	for _, s := range in {
-		out = append(out, secretView{Key: s.Key, Scope: string(s.Scope), Environment: s.Environment, Overrides: s.Overrides})
+		overrides := make([]string, 0, len(s.Overrides))
+		for _, sc := range s.Overrides {
+			overrides = append(overrides, string(sc))
+		}
+		out = append(out, secretView{Key: s.Key, Scope: string(s.Scope), Environment: s.Environment, Overrides: overrides})
 	}
+	return out
+}
+
+func toEffectiveViews(m map[string]db.Scope) []effectiveView {
+	out := make([]effectiveView, 0, len(m))
+	for key, scope := range m {
+		out = append(out, effectiveView{Key: key, Scope: string(scope)})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out
 }
 
@@ -211,7 +243,7 @@ func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
 	out := make([]projectView, 0, len(projects))
 	for _, p := range projects {
 		pv := projectView{Slug: p.Slug, AllowExecute: p.AllowExecute, Globals: []secretView{}, Environments: []envView{}}
-		globals, err := s.store.ListSecrets(ctx, p.Slug, "")
+		globals, err := s.store.ScopeSecrets(ctx, p.Slug, "")
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -223,16 +255,50 @@ func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, e := range envs {
-			secrets, err := s.store.ListSecrets(ctx, p.Slug, e.Name)
+			secrets, err := s.store.ScopeSecrets(ctx, p.Slug, e.Name)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
-			pv.Environments = append(pv.Environments, envView{Name: e.Name, Secrets: toSecretViews(secrets)})
+			effective, err := s.store.EffectiveScopes(ctx, p.Slug, e.Name)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			pv.Environments = append(pv.Environments, envView{
+				Name:      e.Name,
+				Secrets:   toSecretViews(secrets),
+				Effective: toEffectiveViews(effective),
+			})
 		}
 		out = append(out, pv)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"projects": out})
+
+	sharedGlobal, err := s.store.ScopeSecrets(ctx, "", "")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	names, err := s.store.ListSharedEnvironments(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	sharedEnvs := make([]sharedEnvView, 0, len(names))
+	for _, name := range names {
+		secrets, err := s.store.ScopeSecrets(ctx, "", name)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		sharedEnvs = append(sharedEnvs, sharedEnvView{Name: name, Secrets: toSecretViews(secrets)})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"projects":            out,
+		"shared":              sharedView{Global: toSecretViews(sharedGlobal), Environments: sharedEnvs},
+		"shared_environments": names,
+	})
 }
 
 func (s *server) handleAudit(w http.ResponseWriter, r *http.Request) {
@@ -243,6 +309,10 @@ func (s *server) handleAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]map[string]any, 0, len(entries))
 	for _, e := range entries {
+		scopes := make([]string, 0, len(e.KeyScopes))
+		for _, sc := range e.KeyScopes {
+			scopes = append(scopes, string(sc))
+		}
 		out = append(out, map[string]any{
 			"timestamp":   e.Timestamp,
 			"client":      e.Client,
@@ -250,6 +320,7 @@ func (s *server) handleAudit(w http.ResponseWriter, r *http.Request) {
 			"environment": e.Environment,
 			"tool":        e.Tool,
 			"key_names":   e.KeyNames,
+			"key_scopes":  scopes,
 			"command":     e.Command,
 			"exit_code":   e.ExitCode,
 			"redactions":  e.Redactions,
@@ -358,7 +429,7 @@ func (s *server) handleProjectSub(w http.ResponseWriter, r *http.Request) {
 		if !readJSON(w, r, &body) {
 			return
 		}
-		value, err := s.store.ResolveKey(ctx, slug, body.Environment, body.Key)
+		value, err := s.scopeValue(ctx, slug, body.Environment, body.Key)
 		if err != nil {
 			writeError(w, http.StatusNotFound, err)
 			return
@@ -368,6 +439,72 @@ func (s *server) handleProjectSub(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// handleShared manages the cross-project scopes: global (empty environment)
+// and environment-global (named environment).
+func (s *server) handleShared(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/api/shared/")
+	ctx := r.Context()
+
+	switch {
+	case rest == "secrets" && r.Method == http.MethodPost:
+		var body struct {
+			Environment string `json:"environment"`
+			Key         string `json:"key"`
+			Value       string `json:"value"`
+		}
+		if !readJSON(w, r, &body) {
+			return
+		}
+		short, err := s.store.PutSecret(ctx, "", body.Environment, strings.TrimSpace(body.Key), body.Value)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"short": short})
+
+	case rest == "secrets" && r.Method == http.MethodDelete:
+		environment := r.URL.Query().Get("environment")
+		key := r.URL.Query().Get("key")
+		if err := s.store.DeleteSecret(ctx, "", environment, key); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": key})
+
+	case rest == "secrets/reveal" && r.Method == http.MethodPost:
+		var body struct {
+			Environment string `json:"environment"`
+			Key         string `json:"key"`
+		}
+		if !readJSON(w, r, &body) {
+			return
+		}
+		value, err := s.scopeValue(ctx, "", body.Environment, body.Key)
+		if err != nil {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"value": value})
+
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// scopeValue returns the value defined in exactly one scope, so a reveal never
+// silently falls back to a broader scope.
+func (s *server) scopeValue(ctx context.Context, project, environment, key string) (string, error) {
+	values, err := s.store.ScopeValues(ctx, project, environment)
+	if err != nil {
+		return "", err
+	}
+	value, ok := values[key]
+	if !ok {
+		return "", fmt.Errorf("%w: %q", db.ErrSecretNotFound, key)
+	}
+	return value, nil
 }
 
 func (s *server) handleExport(w http.ResponseWriter, r *http.Request) {

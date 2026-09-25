@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -142,5 +143,96 @@ func TestDevAssets(t *testing.T) {
 	}
 	if _, err := s.asset("dist/app.css"); err != nil {
 		t.Fatalf("dev asset app.css: %v", err)
+	}
+}
+
+func TestSharedSecretLifecycleViaAPI(t *testing.T) {
+	_, _, mux := newTestWeb(t)
+
+	if got := do(t, mux, http.MethodPost, "/api/shared/secrets", `{"environment":"","key":"GLOBAL_TOKEN","value":"global-value-123"}`, testToken, "").Code; got != http.StatusOK {
+		t.Fatalf("put global status = %d", got)
+	}
+	if got := do(t, mux, http.MethodPost, "/api/shared/secrets", `{"environment":"staging","key":"SHARED_ENV","value":"shared-env-value-123"}`, testToken, "").Code; got != http.StatusOK {
+		t.Fatalf("put shared env status = %d", got)
+	}
+
+	reveal := do(t, mux, http.MethodPost, "/api/shared/secrets/reveal", `{"environment":"staging","key":"SHARED_ENV"}`, testToken, "")
+	if reveal.Code != http.StatusOK || !strings.Contains(reveal.Body.String(), "shared-env-value-123") {
+		t.Fatalf("reveal = %d %s", reveal.Code, reveal.Body.String())
+	}
+
+	del := do(t, mux, http.MethodDelete, "/api/shared/secrets?environment=staging&key=SHARED_ENV", "", testToken, "")
+	if del.Code != http.StatusOK {
+		t.Fatalf("delete status = %d", del.Code)
+	}
+}
+
+func TestRevealIsScopeQualified(t *testing.T) {
+	_, store, mux := newTestWeb(t)
+	ctx := context.Background()
+	_, _ = store.CreateProject(ctx, "my-api")
+	_, _ = store.CreateEnvironment(ctx, "my-api", "staging")
+	_, _ = store.PutSecret(ctx, "", "staging", "API_KEY", "shared-value-123")
+	_, _ = store.PutSecret(ctx, "my-api", "staging", "API_KEY", "project-value-123")
+
+	projectReveal := do(t, mux, http.MethodPost, "/api/projects/my-api/secrets/reveal", `{"environment":"staging","key":"API_KEY"}`, testToken, "")
+	if projectReveal.Code != http.StatusOK || !strings.Contains(projectReveal.Body.String(), "project-value-123") {
+		t.Fatalf("project reveal = %d %s", projectReveal.Code, projectReveal.Body.String())
+	}
+
+	sharedReveal := do(t, mux, http.MethodPost, "/api/shared/secrets/reveal", `{"environment":"staging","key":"API_KEY"}`, testToken, "")
+	if sharedReveal.Code != http.StatusOK || !strings.Contains(sharedReveal.Body.String(), "shared-value-123") {
+		t.Fatalf("shared reveal = %d %s", sharedReveal.Code, sharedReveal.Body.String())
+	}
+}
+
+func TestStateExposesSharedAndEffective(t *testing.T) {
+	_, store, mux := newTestWeb(t)
+	ctx := context.Background()
+	_, _ = store.CreateProject(ctx, "my-api")
+	_, _ = store.CreateEnvironment(ctx, "my-api", "staging")
+	_, _ = store.PutSecret(ctx, "", "", "GLOBAL_TOKEN", "global-value-123")
+	_, _ = store.PutSecret(ctx, "", "staging", "SHARED_ENV", "shared-env-value-123")
+	_, _ = store.PutSecret(ctx, "my-api", "staging", "API_KEY", "project-value-123")
+
+	w := do(t, mux, http.MethodGet, "/api/state", "", testToken, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{"GLOBAL_TOKEN", "SHARED_ENV", "API_KEY", "shared", "effective", "shared_environments", "project_environment"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("state missing %q: %s", want, body)
+		}
+	}
+	for _, leaked := range []string{"global-value-123", "shared-env-value-123", "project-value-123"} {
+		if strings.Contains(body, leaked) {
+			t.Fatalf("state leaked value %q", leaked)
+		}
+	}
+
+	var payload struct {
+		Projects []struct {
+			Environments []struct {
+				Name      string `json:"name"`
+				Effective []struct {
+					Key   string `json:"key"`
+					Scope string `json:"scope"`
+				} `json:"effective"`
+			} `json:"environments"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("state not JSON: %v", err)
+	}
+	if len(payload.Projects) != 1 || len(payload.Projects[0].Environments) != 1 {
+		t.Fatalf("unexpected state shape: %+v", payload)
+	}
+	effective := map[string]string{}
+	for _, e := range payload.Projects[0].Environments[0].Effective {
+		effective[e.Key] = e.Scope
+	}
+	if effective["API_KEY"] != "project_environment" || effective["SHARED_ENV"] != "environment" || effective["GLOBAL_TOKEN"] != "global" {
+		t.Fatalf("effective sources = %v", effective)
 	}
 }

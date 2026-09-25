@@ -285,3 +285,81 @@ func TestProxyCrossHostRedirectStripsAuth(t *testing.T) {
 		t.Fatalf("Authorization forwarded across hosts: %q", backendAuth)
 	}
 }
+
+func TestSharedKeysListedAndInjected(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	if _, err := store.PutSecret(ctx, "", "", "GLOBAL_TOKEN", "global-secret-123"); err != nil {
+		t.Fatalf("PutSecret global: %v", err)
+	}
+	if _, err := store.PutSecret(ctx, "", "staging", "SHARED_ENV", "shared-env-secret-123"); err != nil {
+		t.Fatalf("PutSecret shared env: %v", err)
+	}
+
+	res, err := srv.handleListSecretKeys(ctx, call("list_secret_keys", nil))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	text := resultText(t, res)
+	if !strings.Contains(text, "GLOBAL_TOKEN") || !strings.Contains(text, "SHARED_ENV") {
+		t.Fatalf("shared keys missing from %s", text)
+	}
+
+	if err := store.SetAllowExecute(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowExecute: %v", err)
+	}
+	run, err := srv.handleExecute(ctx, call("execute_with_secrets", map[string]any{
+		"command": "sh",
+		"args":    []any{"-c", "echo $GLOBAL_TOKEN"},
+	}))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	runText := resultText(t, run)
+	if strings.Contains(runText, "global-secret-123") {
+		t.Fatalf("shared value leaked in %s", runText)
+	}
+	if !strings.Contains(runText, "[BLINDENV_REDACTED:GLOBAL_TOKEN]") {
+		t.Fatalf("expected shared key redaction in %s", runText)
+	}
+}
+
+func TestAuditRecordsSourceScope(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	if _, err := store.PutSecret(ctx, "", "", "GLOBAL_TOKEN", "global-secret-123"); err != nil {
+		t.Fatalf("PutSecret global: %v", err)
+	}
+	if err := store.SetAllowExecute(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowExecute: %v", err)
+	}
+	if _, err := srv.handleExecute(ctx, call("execute_with_secrets", map[string]any{
+		"command": "sh",
+		"args":    []any{"-c", "echo $GLOBAL_TOKEN"},
+	})); err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	entries, err := store.ListAudit(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	if len(e.KeyScopes) != len(e.KeyNames) {
+		t.Fatalf("key scopes %v not aligned with names %v", e.KeyScopes, e.KeyNames)
+	}
+	found := false
+	for i, k := range e.KeyNames {
+		if k == "GLOBAL_TOKEN" {
+			found = true
+			if e.KeyScopes[i] != db.ScopeGlobal {
+				t.Fatalf("GLOBAL_TOKEN scope = %q, want global", e.KeyScopes[i])
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("GLOBAL_TOKEN missing from audit names %v", e.KeyNames)
+	}
+}

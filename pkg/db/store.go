@@ -244,212 +244,267 @@ func (s *Store) ListEnvironments(ctx context.Context, slug string) ([]Environmen
 	return out, rows.Err()
 }
 
-// DeleteEnvironment removes an environment and its secrets.
+// DeleteEnvironment removes an environment and its project secrets.
 func (s *Store) DeleteEnvironment(ctx context.Context, slug, name string) error {
 	pid, err := s.projectID(ctx, slug)
 	if err != nil {
 		return err
 	}
-	res, err := s.db.ExecContext(ctx, `DELETE FROM environments WHERE project_id = ? AND name = ?`, pid, name)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("db: delete environment: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM secrets WHERE project_id = ? AND environment = ?`, pid, name); err != nil {
+		return fmt.Errorf("db: delete environment secrets: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM environments WHERE project_id = ? AND name = ?`, pid, name)
 	if err != nil {
 		return fmt.Errorf("db: delete environment: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrEnvironmentNotFound
 	}
-	return nil
+	return tx.Commit()
+}
+
+// ListSharedEnvironments returns the derived set of shared environment names:
+// every project environment name plus any name that already carries an
+// environment-global secret.
+func (s *Store) ListSharedEnvironments(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT name FROM environments
+		 UNION
+		 SELECT DISTINCT environment FROM secrets WHERE project_id IS NULL AND environment IS NOT NULL
+		 ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("db: list shared environments: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
 }
 
 // --- Secrets ---
 
-// PutSecret stores a secret value. An empty environment means the project
-// global scope. It returns true when the value is shorter than
-// MinSecretLength and therefore cannot be reliably redacted.
-func (s *Store) PutSecret(ctx context.Context, slug, environment, key, value string) (bool, error) {
+// scopeWhere builds the predicate that selects definitions in exactly one
+// scope. A nil project means shared; an empty environment means all
+// environments.
+func (s *Store) scopeWhere(pid *int64, environment string) (string, []any) {
+	switch {
+	case pid == nil && environment == "":
+		return `project_id IS NULL AND environment IS NULL`, nil
+	case pid == nil:
+		return `project_id IS NULL AND environment = ?`, []any{environment}
+	case environment == "":
+		return `project_id = ? AND environment IS NULL`, []any{*pid}
+	default:
+		return `project_id = ? AND environment = ?`, []any{*pid, environment}
+	}
+}
+
+// resolveScope maps a (project, environment) selector to storage keys. An
+// empty project selects the shared scopes and is not validated against the
+// projects table; a non-empty project with a non-empty environment must exist.
+func (s *Store) resolveScope(ctx context.Context, project, environment string) (*int64, string, error) {
+	if project == "" {
+		return nil, environment, nil
+	}
+	id, err := s.projectID(ctx, project)
+	if err != nil {
+		return nil, "", err
+	}
+	if environment != "" {
+		if _, err := s.environmentID(ctx, id, environment); err != nil {
+			return nil, "", err
+		}
+	}
+	return &id, environment, nil
+}
+
+func scopeOf(isProject, hasEnvironment bool) Scope {
+	switch {
+	case isProject && hasEnvironment:
+		return ScopeProjectEnvironment
+	case isProject:
+		return ScopeProject
+	case hasEnvironment:
+		return ScopeSharedEnvironment
+	default:
+		return ScopeGlobal
+	}
+}
+
+func priorityOf(isProject, hasEnvironment bool) int {
+	switch {
+	case isProject && hasEnvironment:
+		return 4
+	case isProject:
+		return 3
+	case hasEnvironment:
+		return 2
+	default:
+		return 1
+	}
+}
+
+type resolvedSecret struct {
+	key      string
+	scope    Scope
+	env      string
+	enc      []byte
+	shadowed []Scope
+}
+
+type candidate struct {
+	scope Scope
+	env   string
+	enc   []byte
+	prio  int
+}
+
+// effectiveSecrets resolves the winner for every key applicable to a project
+// and environment. A nil project means the shared scopes.
+func (s *Store) effectiveSecrets(ctx context.Context, pid *int64, environment string) (map[string]resolvedSecret, error) {
+	var pidArg any
+	if pid != nil {
+		pidArg = *pid
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT key, value_enc, project_id, environment FROM secrets
+		 WHERE (project_id = ? OR project_id IS NULL)
+		   AND (environment = ? OR environment IS NULL)`,
+		pidArg, environment)
+	if err != nil {
+		return nil, fmt.Errorf("db: query effective secrets: %w", err)
+	}
+	defer rows.Close()
+
+	byKey := make(map[string][]candidate)
+	for rows.Next() {
+		var (
+			key  string
+			enc  []byte
+			proj sql.NullInt64
+			env  sql.NullString
+		)
+		if err := rows.Scan(&key, &enc, &proj, &env); err != nil {
+			return nil, err
+		}
+		byKey[key] = append(byKey[key], candidate{
+			scope: scopeOf(proj.Valid, env.Valid),
+			env:   env.String,
+			enc:   enc,
+			prio:  priorityOf(proj.Valid, env.Valid),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]resolvedSecret, len(byKey))
+	for key, cands := range byKey {
+		winner := 0
+		for i := range cands {
+			if cands[i].prio > cands[winner].prio {
+				winner = i
+			}
+		}
+		others := make([]candidate, 0, len(cands)-1)
+		for i, c := range cands {
+			if i != winner {
+				others = append(others, c)
+			}
+		}
+		sort.Slice(others, func(i, j int) bool { return others[i].prio > others[j].prio })
+		shadowed := make([]Scope, 0, len(others))
+		for _, c := range others {
+			shadowed = append(shadowed, c.scope)
+		}
+		out[key] = resolvedSecret{
+			key:      key,
+			scope:    cands[winner].scope,
+			env:      cands[winner].env,
+			enc:      cands[winner].enc,
+			shadowed: shadowed,
+		}
+	}
+	return out, nil
+}
+
+// PutSecret stores a secret value. An empty project selects the shared scopes
+// and an empty environment the all-environments scope, so the four
+// combinations address the four scopes. It returns true when the value is
+// shorter than MinSecretLength and therefore cannot be reliably redacted.
+func (s *Store) PutSecret(ctx context.Context, project, environment, key, value string) (bool, error) {
 	if strings.TrimSpace(key) == "" {
 		return false, ErrInvalidName
 	}
-	pid, err := s.projectID(ctx, slug)
+	pid, env, err := s.resolveScope(ctx, project, environment)
 	if err != nil {
 		return false, err
-	}
-	var envID *int64
-	if environment != "" {
-		id, err := s.environmentID(ctx, pid, environment)
-		if err != nil {
-			return false, err
-		}
-		envID = &id
 	}
 	enc, err := crypto.Encrypt(s.key, []byte(value))
 	if err != nil {
 		return false, err
 	}
 	now := nowString()
+	where, wargs := s.scopeWhere(pid, env)
 
-	var res sql.Result
-	if envID == nil {
-		res, err = s.db.ExecContext(ctx,
-			`UPDATE secrets SET value_enc = ?, updated_at = ? WHERE project_id = ? AND environment_id IS NULL AND key = ?`,
-			enc, now, pid, key)
-	} else {
-		res, err = s.db.ExecContext(ctx,
-			`UPDATE secrets SET value_enc = ?, updated_at = ? WHERE project_id = ? AND environment_id = ? AND key = ?`,
-			enc, now, pid, *envID, key)
-	}
+	updateArgs := append([]any{enc, now}, wargs...)
+	updateArgs = append(updateArgs, key)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE secrets SET value_enc = ?, updated_at = ? WHERE `+where+` AND key = ?`, updateArgs...)
 	if err != nil {
 		return false, fmt.Errorf("db: update secret: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		if envID == nil {
-			_, err = s.db.ExecContext(ctx,
-				`INSERT INTO secrets (project_id, environment_id, key, value_enc, created_at, updated_at) VALUES (?, NULL, ?, ?, ?, ?)`,
-				pid, key, enc, now, now)
-		} else {
-			_, err = s.db.ExecContext(ctx,
-				`INSERT INTO secrets (project_id, environment_id, key, value_enc, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-				pid, *envID, key, enc, now, now)
+		var pidArg, envArg any
+		if pid != nil {
+			pidArg = *pid
 		}
-		if err != nil && !isUniqueViolation(err) {
-			return false, fmt.Errorf("db: insert secret: %w", err)
+		if env != "" {
+			envArg = env
+		}
+		_, err = s.db.ExecContext(ctx,
+			`INSERT INTO secrets (project_id, environment, key, value_enc, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+			pidArg, envArg, key, enc, now, now)
+		if err != nil {
+			if isUniqueViolation(err) {
+				if _, uerr := s.db.ExecContext(ctx,
+					`UPDATE secrets SET value_enc = ?, updated_at = ? WHERE `+where+` AND key = ?`, updateArgs...); uerr != nil {
+					return false, fmt.Errorf("db: update secret after conflict: %w", uerr)
+				}
+			} else {
+				return false, fmt.Errorf("db: insert secret: %w", err)
+			}
 		}
 	}
 	return len(value) < MinSecretLength, nil
 }
 
-func (s *Store) keySet(ctx context.Context, pid int64, envID *int64) (map[string][]byte, error) {
-	query := `SELECT key, value_enc FROM secrets WHERE project_id = ? AND environment_id IS NULL`
-	args := []any{pid}
-	if envID != nil {
-		query = `SELECT key, value_enc FROM secrets WHERE project_id = ? AND (environment_id IS NULL OR environment_id = ?)`
-		args = append(args, *envID)
-	}
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("db: query secrets: %w", err)
-	}
-	defer rows.Close()
-	out := make(map[string][]byte)
-	for rows.Next() {
-		var (
-			key string
-			enc []byte
-		)
-		if err := rows.Scan(&key, &enc); err != nil {
-			return nil, err
-		}
-		out[key] = enc
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) resolveEnv(ctx context.Context, slug, environment string) (int64, *int64, error) {
-	pid, err := s.projectID(ctx, slug)
-	if err != nil {
-		return 0, nil, err
-	}
-	if environment == "" {
-		return pid, nil, nil
-	}
-	id, err := s.environmentID(ctx, pid, environment)
-	if err != nil {
-		return 0, nil, err
-	}
-	return pid, &id, nil
-}
-
-// ListKeys returns the effective key names (union of globals and the
-// environment) without duplicates, sorted.
-func (s *Store) ListKeys(ctx context.Context, slug, environment string) ([]string, error) {
-	pid, envID, err := s.resolveEnv(ctx, slug, environment)
-	if err != nil {
-		return nil, err
-	}
-	values, err := s.keySet(ctx, pid, envID)
-	if err != nil {
-		return nil, err
-	}
-	keys := make([]string, 0, len(values))
-	for k := range values {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys, nil
-}
-
-// ListSecrets returns metadata for the effective secrets, marking which
-// environment entries override a global.
-func (s *Store) ListSecrets(ctx context.Context, slug, environment string) ([]SecretInfo, error) {
-	pid, envID, err := s.resolveEnv(ctx, slug, environment)
-	if err != nil {
-		return nil, err
-	}
-	globals, err := s.keySet(ctx, pid, nil)
-	if err != nil {
-		return nil, err
-	}
-	effective, err := s.keySet(ctx, pid, envID)
-	if err != nil {
-		return nil, err
-	}
-	var envKeys map[string][]byte
-	if envID != nil {
-		envKeys, err = s.envOnlyKeys(ctx, pid, *envID)
-		if err != nil {
-			return nil, err
-		}
-	}
-	out := make([]SecretInfo, 0, len(effective))
-	for key := range effective {
-		info := SecretInfo{Key: key, Scope: ScopeGlobal}
-		if envKeys != nil {
-			if _, ok := envKeys[key]; ok {
-				info.Scope = ScopeEnvironment
-				info.Environment = environment
-				_, info.Overrides = globals[key]
-			}
-		}
-		out = append(out, info)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
-	return out, nil
-}
-
-func (s *Store) envOnlyKeys(ctx context.Context, pid, envID int64) (map[string][]byte, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT key, value_enc FROM secrets WHERE project_id = ? AND environment_id = ?`, pid, envID)
-	if err != nil {
-		return nil, fmt.Errorf("db: query environment secrets: %w", err)
-	}
-	defer rows.Close()
-	out := make(map[string][]byte)
-	for rows.Next() {
-		var (
-			key string
-			enc []byte
-		)
-		if err := rows.Scan(&key, &enc); err != nil {
-			return nil, err
-		}
-		out[key] = enc
-	}
-	return out, rows.Err()
-}
-
 // Resolve returns the effective plaintext values for a project and
-// environment, with environment values taking precedence over globals.
-func (s *Store) Resolve(ctx context.Context, slug, environment string) (map[string]string, error) {
-	pid, envID, err := s.resolveEnv(ctx, slug, environment)
+// environment, applying the four-tier precedence.
+func (s *Store) Resolve(ctx context.Context, project, environment string) (map[string]string, error) {
+	pid, _, err := s.resolveScope(ctx, project, environment)
 	if err != nil {
 		return nil, err
 	}
-	values, err := s.keySet(ctx, pid, envID)
+	effective, err := s.effectiveSecrets(ctx, pid, environment)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]string, len(values))
-	for key, enc := range values {
-		plain, err := crypto.Decrypt(s.key, enc)
+	out := make(map[string]string, len(effective))
+	for key, r := range effective {
+		plain, err := crypto.Decrypt(s.key, r.enc)
 		if err != nil {
 			return nil, fmt.Errorf("db: decrypt %q: %w", key, err)
 		}
@@ -459,8 +514,8 @@ func (s *Store) Resolve(ctx context.Context, slug, environment string) (map[stri
 }
 
 // ResolveKey returns the effective plaintext value of a single key.
-func (s *Store) ResolveKey(ctx context.Context, slug, environment, key string) (string, error) {
-	all, err := s.Resolve(ctx, slug, environment)
+func (s *Store) ResolveKey(ctx context.Context, project, environment, key string) (string, error) {
+	all, err := s.Resolve(ctx, project, environment)
 	if err != nil {
 		return "", err
 	}
@@ -471,48 +526,205 @@ func (s *Store) ResolveKey(ctx context.Context, slug, environment, key string) (
 	return value, nil
 }
 
-// ScopeValues returns the plaintext values defined exclusively in the given
-// scope: globals when environment is empty, otherwise only that environment's
-// own secrets (not the fallback globals).
-func (s *Store) ScopeValues(ctx context.Context, slug, environment string) (map[string]string, error) {
-	pid, envID, err := s.resolveEnv(ctx, slug, environment)
+// ListKeys returns the effective key names without duplicates, sorted.
+func (s *Store) ListKeys(ctx context.Context, project, environment string) ([]string, error) {
+	pid, _, err := s.resolveScope(ctx, project, environment)
 	if err != nil {
 		return nil, err
 	}
-	var enc map[string][]byte
-	if envID == nil {
-		enc, err = s.keySet(ctx, pid, nil)
-	} else {
-		enc, err = s.envOnlyKeys(ctx, pid, *envID)
-	}
+	effective, err := s.effectiveSecrets(ctx, pid, environment)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]string, len(enc))
-	for key, value := range enc {
-		plain, err := crypto.Decrypt(s.key, value)
+	keys := make([]string, 0, len(effective))
+	for k := range effective {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys, nil
+}
+
+// ListSecrets returns metadata for the effective secrets with their winning
+// scope and the broader scopes they shadow.
+func (s *Store) ListSecrets(ctx context.Context, project, environment string) ([]SecretInfo, error) {
+	pid, _, err := s.resolveScope(ctx, project, environment)
+	if err != nil {
+		return nil, err
+	}
+	effective, err := s.effectiveSecrets(ctx, pid, environment)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SecretInfo, 0, len(effective))
+	for key, r := range effective {
+		out = append(out, SecretInfo{Key: key, Scope: r.scope, Environment: r.env, Overrides: r.shadowed})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out, nil
+}
+
+// EffectiveScopes returns the winning scope for every effective key of a
+// project and environment, without values.
+func (s *Store) EffectiveScopes(ctx context.Context, project, environment string) (map[string]Scope, error) {
+	pid, _, err := s.resolveScope(ctx, project, environment)
+	if err != nil {
+		return nil, err
+	}
+	effective, err := s.effectiveSecrets(ctx, pid, environment)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]Scope, len(effective))
+	for key, r := range effective {
+		out[key] = r.scope
+	}
+	return out, nil
+}
+
+func (s *Store) decryptScope(ctx context.Context, pid *int64, environment string) (map[string]string, error) {
+	where, args := s.scopeWhere(pid, environment)
+	rows, err := s.db.QueryContext(ctx, `SELECT key, value_enc FROM secrets WHERE `+where, args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: query secrets: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]string)
+	for rows.Next() {
+		var (
+			key string
+			enc []byte
+		)
+		if err := rows.Scan(&key, &enc); err != nil {
+			return nil, err
+		}
+		plain, err := crypto.Decrypt(s.key, enc)
 		if err != nil {
 			return nil, fmt.Errorf("db: decrypt %q: %w", key, err)
 		}
 		out[key] = string(plain)
 	}
+	return out, rows.Err()
+}
+
+// ScopeValues returns the plaintext values defined exclusively in the given
+// scope: shared global when project and environment are empty, shared
+// environment-global when only project is empty, project-global when only
+// environment is empty, and the project + environment scope otherwise.
+func (s *Store) ScopeValues(ctx context.Context, project, environment string) (map[string]string, error) {
+	pid, env, err := s.resolveScope(ctx, project, environment)
+	if err != nil {
+		return nil, err
+	}
+	return s.decryptScope(ctx, pid, env)
+}
+
+type broaderDef struct {
+	pid   *int64
+	env   string
+	scope Scope
+}
+
+func (s *Store) broaderDefs(ctx context.Context, project string, pid *int64, environment string) ([]broaderDef, error) {
+	switch {
+	case project == "" && environment == "":
+		return nil, nil
+	case project == "":
+		return []broaderDef{{nil, "", ScopeGlobal}}, nil
+	case environment == "":
+		envs, err := s.ListEnvironments(ctx, project)
+		if err != nil {
+			return nil, err
+		}
+		defs := make([]broaderDef, 0, len(envs)+1)
+		for _, e := range envs {
+			defs = append(defs, broaderDef{nil, e.Name, ScopeSharedEnvironment})
+		}
+		defs = append(defs, broaderDef{nil, "", ScopeGlobal})
+		return defs, nil
+	default:
+		return []broaderDef{
+			{pid, "", ScopeProject},
+			{nil, environment, ScopeSharedEnvironment},
+			{nil, "", ScopeGlobal},
+		}, nil
+	}
+}
+
+func (s *Store) scopeDefines(ctx context.Context, pid *int64, environment, key string) (bool, error) {
+	where, args := s.scopeWhere(pid, environment)
+	args = append(args, key)
+	var one int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM secrets WHERE `+where+` AND key = ? LIMIT 1`, args...).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("db: scope defines: %w", err)
+	}
+	return true, nil
+}
+
+// ScopeSecrets returns the secrets defined exclusively in the given scope,
+// each annotated with the broader scopes it shadows.
+func (s *Store) ScopeSecrets(ctx context.Context, project, environment string) ([]SecretInfo, error) {
+	pid, env, err := s.resolveScope(ctx, project, environment)
+	if err != nil {
+		return nil, err
+	}
+	where, args := s.scopeWhere(pid, env)
+	rows, err := s.db.QueryContext(ctx, `SELECT key FROM secrets WHERE `+where+` ORDER BY key`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: query scope secrets: %w", err)
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	defs, err := s.broaderDefs(ctx, project, pid, environment)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SecretInfo, 0, len(keys))
+	for _, key := range keys {
+		var overrides []Scope
+		seen := make(map[Scope]bool)
+		for _, d := range defs {
+			if seen[d.scope] {
+				continue
+			}
+			ok, err := s.scopeDefines(ctx, d.pid, d.env, key)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				overrides = append(overrides, d.scope)
+				seen[d.scope] = true
+			}
+		}
+		out = append(out, SecretInfo{Key: key, Scope: scopeOf(pid != nil, env != ""), Environment: env, Overrides: overrides})
+	}
 	return out, nil
 }
 
 // DeleteSecret removes a secret from the given scope.
-func (s *Store) DeleteSecret(ctx context.Context, slug, environment, key string) error {
-	pid, envID, err := s.resolveEnv(ctx, slug, environment)
+func (s *Store) DeleteSecret(ctx context.Context, project, environment, key string) error {
+	pid, env, err := s.resolveScope(ctx, project, environment)
 	if err != nil {
 		return err
 	}
-	var res sql.Result
-	if envID == nil {
-		res, err = s.db.ExecContext(ctx,
-			`DELETE FROM secrets WHERE project_id = ? AND environment_id IS NULL AND key = ?`, pid, key)
-	} else {
-		res, err = s.db.ExecContext(ctx,
-			`DELETE FROM secrets WHERE project_id = ? AND environment_id = ? AND key = ?`, pid, *envID, key)
-	}
+	where, args := s.scopeWhere(pid, env)
+	args = append(args, key)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM secrets WHERE `+where+` AND key = ?`, args...)
 	if err != nil {
 		return fmt.Errorf("db: delete secret: %w", err)
 	}
@@ -526,11 +738,15 @@ func (s *Store) DeleteSecret(ctx context.Context, slug, environment, key string)
 
 // AppendAudit records a tool invocation. Values are never stored.
 func (s *Store) AppendAudit(ctx context.Context, e AuditEntry) error {
+	scopes := make([]string, 0, len(e.KeyScopes))
+	for _, sc := range e.KeyScopes {
+		scopes = append(scopes, string(sc))
+	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO audit_log (ts, client, project, environment, tool, key_names, command, exit_code, redactions)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO audit_log (ts, client, project, environment, tool, key_names, key_scopes, command, exit_code, redactions)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.Timestamp.UTC().Format(time.RFC3339Nano), e.Client, e.Project, e.Environment,
-		e.Tool, strings.Join(e.KeyNames, ","), e.Command, e.ExitCode, e.Redactions)
+		e.Tool, strings.Join(e.KeyNames, ","), strings.Join(scopes, ","), e.Command, e.ExitCode, e.Redactions)
 	if err != nil {
 		return fmt.Errorf("db: append audit: %w", err)
 	}
@@ -543,7 +759,7 @@ func (s *Store) ListAudit(ctx context.Context, limit int) ([]AuditEntry, error) 
 		limit = 200
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, ts, client, project, environment, tool, key_names, command, exit_code, redactions
+		`SELECT id, ts, client, project, environment, tool, key_names, key_scopes, command, exit_code, redactions
 		 FROM audit_log ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("db: list audit: %w", err)
@@ -552,18 +768,24 @@ func (s *Store) ListAudit(ctx context.Context, limit int) ([]AuditEntry, error) 
 	var out []AuditEntry
 	for rows.Next() {
 		var (
-			e    AuditEntry
-			ts   string
-			keys string
-			exit sql.NullInt64
+			e      AuditEntry
+			ts     string
+			keys   string
+			scopes string
+			exit   sql.NullInt64
 		)
 		if err := rows.Scan(&e.ID, &ts, &e.Client, &e.Project, &e.Environment, &e.Tool,
-			&keys, &e.Command, &exit, &e.Redactions); err != nil {
+			&keys, &scopes, &e.Command, &exit, &e.Redactions); err != nil {
 			return nil, err
 		}
 		e.Timestamp = parseTime(ts)
 		if keys != "" {
 			e.KeyNames = strings.Split(keys, ",")
+		}
+		if scopes != "" {
+			for _, sc := range strings.Split(scopes, ",") {
+				e.KeyScopes = append(e.KeyScopes, Scope(sc))
+			}
 		}
 		if exit.Valid {
 			v := int(exit.Int64)

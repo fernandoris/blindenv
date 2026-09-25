@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -117,5 +118,94 @@ func TestImportDuplicateProject(t *testing.T) {
 	seed(t, target)
 	if err := Import(ctx, target, "pass", blob); err == nil {
 		t.Fatal("expected error importing into a vault that already has the project")
+	}
+}
+
+func TestSharedScopesRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	source := newStore(t)
+	seed(t, source)
+	if _, err := source.PutSecret(ctx, "", "", "GLOBAL_TOKEN", "global-value-123"); err != nil {
+		t.Fatalf("PutSecret global: %v", err)
+	}
+	if _, err := source.PutSecret(ctx, "", "staging", "SHARED_ENV", "shared-env-value-123"); err != nil {
+		t.Fatalf("PutSecret shared env: %v", err)
+	}
+
+	blob, err := Export(ctx, source, "backup-pass")
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+
+	target := newStore(t)
+	if err := Import(ctx, target, "backup-pass", blob); err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+
+	global, err := target.ScopeValues(ctx, "", "")
+	if err != nil {
+		t.Fatalf("ScopeValues global: %v", err)
+	}
+	if global["GLOBAL_TOKEN"] != "global-value-123" {
+		t.Fatalf("global token = %q", global["GLOBAL_TOKEN"])
+	}
+	sharedEnv, err := target.ScopeValues(ctx, "", "staging")
+	if err != nil {
+		t.Fatalf("ScopeValues shared env: %v", err)
+	}
+	if sharedEnv["SHARED_ENV"] != "shared-env-value-123" {
+		t.Fatalf("shared env value = %q", sharedEnv["SHARED_ENV"])
+	}
+
+	// A project that does not define them resolves the shared values.
+	got, err := target.Resolve(ctx, "my-api", "staging")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got["GLOBAL_TOKEN"] != "global-value-123" || got["SHARED_ENV"] != "shared-env-value-123" {
+		t.Fatalf("resolved shared values = %v", got)
+	}
+}
+
+func TestImportV1Backup(t *testing.T) {
+	ctx := context.Background()
+	snapshot := data{Projects: []project{{
+		Slug:         "legacy-api",
+		AllowExecute: true,
+		Globals:      map[string]string{"REGION": "eu-west-1"},
+		Environments: []environment{{Name: "staging", Secrets: map[string]string{"API_KEY": "sk-legacy-123"}}},
+	}}}
+	plain, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	salt, err := crypto.NewSalt(saltSize)
+	if err != nil {
+		t.Fatalf("salt: %v", err)
+	}
+	ciphertext, err := crypto.Encrypt(crypto.DeriveKey([]byte("legacy-pass"), salt), plain)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	blob := append(append([]byte{}, magicV1...), salt...)
+	blob = append(blob, ciphertext...)
+
+	target := newStore(t)
+	if err := Import(ctx, target, "legacy-pass", blob); err != nil {
+		t.Fatalf("Import v1: %v", err)
+	}
+	got, err := target.Resolve(ctx, "legacy-api", "staging")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got["REGION"] != "eu-west-1" || got["API_KEY"] != "sk-legacy-123" {
+		t.Fatalf("imported v1 values = %v", got)
+	}
+	p, err := target.GetProject(ctx, "legacy-api")
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	if !p.AllowExecute {
+		t.Fatal("allow_execute not restored from v1")
 	}
 }

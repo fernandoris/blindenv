@@ -1,67 +1,4 @@
-# vault Specification
-
-## Purpose
-
-Stores dev/pre-prod secrets locally and encrypted so that plaintext values exist only in memory, organized in four scopes of increasing specificity: global and environment-global (shared across projects), project-global, and project + environment.
-
-## Requirements
-
-### Requirement: Master key management
-
-The system SHALL obtain the master key (32 bytes) by preferring the operating system keyring and, when it is unavailable, by deriving it from a user-supplied passphrase using Argon2id. The master key MUST NOT ever be stored in plaintext next to the encrypted data.
-
-#### Scenario: Keyring available
-
-- **WHEN** a master key exists in the operating system keyring
-- **THEN** the system uses it without prompting for a passphrase
-
-#### Scenario: Environment without a keyring
-
-- **WHEN** the system runs in an environment without a keyring (e.g. CI or container)
-- **THEN** the system prompts for a passphrase and derives the master key with Argon2id using a persisted salt
-
-#### Scenario: Master key missing without fallback
-
-- **WHEN** there is no key in the keyring and no passphrase is provided
-- **THEN** the system fails with an error explaining how to unlock the vault, without exposing data
-
-### Requirement: Per-value encryption
-
-The system SHALL encrypt each secret value independently with AES-256-GCM and a random nonce per operation. Project, environment and key names MUST remain readable; values MUST NOT.
-
-#### Scenario: Same value encrypted twice
-
-- **WHEN** the same secret value is stored twice
-- **THEN** the resulting ciphertexts are different
-
-#### Scenario: Tamper detection
-
-- **WHEN** the encrypted data of a value is modified on disk
-- **THEN** decryption fails and the system reports an integrity error instead of returning an incorrect value
-
-#### Scenario: Readable metadata
-
-- **WHEN** the storage is inspected without decrypting
-- **THEN** project, environment and key names are readable and values are not
-
-### Requirement: Global and per-environment secret model
-
-The system SHALL allow global secrets (applying to every environment of a project) and per-environment secrets within the same project. When resolving the effective value of a key, the environment value SHALL take precedence over the global value.
-
-#### Scenario: Global applies to all environments
-
-- **WHEN** a key exists only as a project global
-- **THEN** its value resolves in any environment of that project
-
-#### Scenario: Environment overrides global
-
-- **WHEN** a key exists both as a global and in a specific environment
-- **THEN** the value resolved for that environment is the environment value
-
-#### Scenario: Fallback to global
-
-- **WHEN** a key exists as a global and does not exist in the queried environment
-- **THEN** the resolved value is the global value
+## ADDED Requirements
 
 ### Requirement: Shared secret scopes
 
@@ -135,6 +72,8 @@ The system SHALL allow creating, updating and deleting secrets in the environmen
 - **WHEN** a key is created twice in the same shared scope for the same environment name
 - **THEN** the system updates the existing definition instead of creating a duplicate
 
+## MODIFIED Requirements
+
 ### Requirement: Identifiers and uniqueness
 
 The system SHALL identify each project by a unique name (slug). It SHALL allow the same key to exist simultaneously in each of the four scopes (global, environment-global, project-global and project + environment), but MUST NOT allow duplicates within the same scope. Environment sharing SHALL be matched by the environment name exactly.
@@ -158,15 +97,6 @@ The system SHALL identify each project by a unique name (slug). It SHALL allow t
 
 - **WHEN** a key is defined twice in the environment-global scope for the same environment name
 - **THEN** the system stores a single definition and rejects the duplicate as a conflict
-
-### Requirement: Weak secret warning
-
-The system SHALL warn the user when a secret value is too short to be reliably redacted, without necessarily preventing storage.
-
-#### Scenario: Short value
-
-- **WHEN** the user stores a secret whose length is below the redaction threshold
-- **THEN** the system shows a warning that the value will not be redacted from command output
 
 ### Requirement: Portable backup
 

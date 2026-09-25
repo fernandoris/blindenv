@@ -1,29 +1,4 @@
-# web-ui Specification
-
-## Purpose
-
-Provides a local interface for a person to manage projects, environments and secrets, review the audit log, and export or import the vault without depending on the AI agent.
-
-## Requirements
-
-### Requirement: Restricted local exposure
-
-The UI server SHALL listen only on the loopback interface and SHALL require a valid session token and an expected `Host` header for API requests. It MUST NOT expose the API on external interfaces.
-
-#### Scenario: Request without token
-
-- **WHEN** a request reaches the API without a valid token
-- **THEN** the system rejects it
-
-#### Scenario: Unexpected Host header
-
-- **WHEN** a request arrives with an unexpected `Host` header
-- **THEN** the system rejects it
-
-#### Scenario: Network binding
-
-- **WHEN** the UI starts
-- **THEN** the server listens only on `127.0.0.1` and the port is configurable
+## ADDED Requirements
 
 ### Requirement: Scope navigation
 
@@ -43,25 +18,6 @@ The UI SHALL present a scope navigation region with a Shared section (the global
 
 - **WHEN** the user wants to define a value for every project
 - **THEN** the Shared section is reachable without selecting a project first
-
-### Requirement: Project, environment and secret management
-
-The UI SHALL allow creating, listing, editing and deleting projects, environments and secrets in the global, environment-global, project-global and project + environment scopes. It SHALL present one selected scope editor at a time and SHALL distinguish secrets defined in that scope from secrets inherited from broader scopes, naming the broader scope each inherited secret comes from.
-
-#### Scenario: Override marker
-
-- **WHEN** a secret defined in the selected scope has the same name as one in a broader scope
-- **THEN** the UI indicates it visually as an override
-
-#### Scenario: Secret creation
-
-- **WHEN** the user creates a secret specifying project or shared scope, name, value and, when applicable, environment
-- **THEN** the secret becomes available for resolution by the Tools in every matching project and environment
-
-#### Scenario: Inherited secret display
-
-- **WHEN** the user opens a project + environment scope
-- **THEN** the UI lists keys defined there separately from keys inherited from the project-global, environment-global and global scopes, each labeled with its source
 
 ### Requirement: Definition and resolution separated
 
@@ -90,25 +46,6 @@ The UI SHALL let the user turn an inherited key into a definition in the selecte
 
 - **WHEN** a secret defined in the selected scope has the same name as a broader-scope secret
 - **THEN** the UI indicates that it overrides the broader scope
-
-### Requirement: Explicit reveal of values
-
-The UI MUST NOT display secret values in listings and SHALL require an explicit user action to reveal one, qualified by the scope that defines it. A revealed value SHALL be re-masked after a short interval and SHALL offer a copy action.
-
-#### Scenario: Listing without values
-
-- **WHEN** the user opens the secrets view of any scope
-- **THEN** only names and metadata are shown, not values
-
-#### Scenario: Reveal on demand
-
-- **WHEN** the user requests to reveal a specific secret in a specific scope
-- **THEN** the system shows that scope's value and re-masks it after the interval
-
-#### Scenario: Shared value reveal is explicit
-
-- **WHEN** the user reveals a value defined in a shared scope
-- **THEN** the UI makes clear that the value applies beyond the current project
 
 ### Requirement: Destructive action safeguards
 
@@ -148,14 +85,45 @@ The UI SHALL report successes and errors inline instead of blocking alerts, SHAL
 - **WHEN** the user navigates scopes or reveals a value
 - **THEN** the current scope, expanded state and revealed state are exposed to assistive technology
 
-### Requirement: Execution permission control
+## MODIFIED Requirements
 
-The UI SHALL allow enabling or disabling execution with secrets (`allow_execute`) per project.
+### Requirement: Project, environment and secret management
 
-#### Scenario: Permission change
+The UI SHALL allow creating, listing, editing and deleting projects, environments and secrets in the global, environment-global, project-global and project + environment scopes. It SHALL present one selected scope editor at a time and SHALL distinguish secrets defined in that scope from secrets inherited from broader scopes, naming the broader scope each inherited secret comes from.
 
-- **WHEN** the user disables `allow_execute` for a project
-- **THEN** invocations of `execute_with_secrets` on that project are rejected
+#### Scenario: Override marker
+
+- **WHEN** a secret defined in the selected scope has the same name as one in a broader scope
+- **THEN** the UI indicates it visually as an override
+
+#### Scenario: Secret creation
+
+- **WHEN** the user creates a secret specifying project or shared scope, name, value and, when applicable, environment
+- **THEN** the secret becomes available for resolution by the Tools in every matching project and environment
+
+#### Scenario: Inherited secret display
+
+- **WHEN** the user opens a project + environment scope
+- **THEN** the UI lists keys defined there separately from keys inherited from the project-global, environment-global and global scopes, each labeled with its source
+
+### Requirement: Explicit reveal of values
+
+The UI MUST NOT display secret values in listings and SHALL require an explicit user action to reveal one, qualified by the scope that defines it. A revealed value SHALL be re-masked after a short interval and SHALL offer a copy action.
+
+#### Scenario: Listing without values
+
+- **WHEN** the user opens the secrets view of any scope
+- **THEN** only names and metadata are shown, not values
+
+#### Scenario: Reveal on demand
+
+- **WHEN** the user requests to reveal a specific secret in a specific scope
+- **THEN** the system shows that scope's value and re-masks it after the interval
+
+#### Scenario: Shared value reveal is explicit
+
+- **WHEN** the user reveals a value defined in a shared scope
+- **THEN** the UI makes clear that the value applies beyond the current project
 
 ### Requirement: Audit review
 
@@ -175,17 +143,3 @@ The UI SHALL display the audit log from a slide-over panel opened on demand, inc
 
 - **WHEN** the user filters by project or environment
 - **THEN** only matching audit entries are shown
-
-### Requirement: Vault export and import
-
-The UI SHALL allow exporting the vault to a passphrase-encrypted backup and importing it, reporting the outcome.
-
-#### Scenario: Export
-
-- **WHEN** the user exports the vault providing a passphrase
-- **THEN** an encrypted backup file is generated
-
-#### Scenario: Failed import
-
-- **WHEN** the user imports a backup with an incorrect passphrase
-- **THEN** the system shows an error and does not alter the current vault

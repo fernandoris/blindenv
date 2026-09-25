@@ -52,9 +52,9 @@ Additional defaults that reduce risk:
 - **Encrypted local vault** — embedded SQLite, per-value AES-256-GCM, master key in the OS keyring (macOS Keychain, Windows Credential Manager, Linux Secret Service) with a passphrase fallback for headless/CI.
 - **MCP server (stdio)** with four tools: `list_secret_keys`, `get_context`, `proxy_http_request`, `execute_with_secrets`.
 - **Redaction engine** — normalizes output encoding (including Windows PowerShell UTF-16), replaces values with `[BLINDENV_REDACTED:KEY]`, longest-first, with a minimum-length guard.
-- **Project model** — a project holds **global** secrets plus **per-environment** secrets; environment values override globals.
-- **Local dashboard** (`blindenv ui`) — manage projects, environments and secrets, reveal on demand, toggle execution, review the audit log, export/import backups. Bound to loopback and protected by a session token.
-- **Portable backup** — export the vault encrypted with a passphrase so it survives a lost keyring entry.
+- **Four-tier secret model** — a secret is defined in exactly one of four scopes, most specific wins: **project + environment** > **project-global** (all environments of a project) > **environment-global** (one environment shared by every project) > **global** (all projects, all environments).
+- **Local dashboard** (`blindenv ui`) — master-detail scope navigation over the shared and project scopes, secrets defined vs inherited (with their source), a read-only effective-resolution view, reveal on demand, execution toggle, an on-demand audit slide-over and export/import backups. Bound to loopback and protected by a session token.
+- **Portable backup** — export the vault (including the shared scopes) encrypted with a passphrase so it survives a lost keyring entry; backups written before shared scopes existed are still importable.
 - **Single binary** — pure Go, no CGO, cross-compiles to Windows, macOS and Linux.
 
 ---
@@ -77,6 +77,37 @@ Requires Go 1.24+.
 go install github.com/fernandoris/blindenv/cmd/blindenv@latest
 ```
 
+### Updating
+
+Check the version you are running:
+
+```sh
+blindenv version
+```
+
+Update with the same method you installed with:
+
+```sh
+# from a source checkout
+cd blindenv && git pull && go build -o blindenv ./cmd/blindenv
+
+# or, if the binary lives on your PATH via go install
+go install github.com/fernandoris/blindenv/cmd/blindenv@latest
+```
+
+Then replace the binary on your `PATH` with the freshly built one. The dashboard
+stylesheet is committed and embedded in the binary, so no extra build step is
+needed. Configured agents do not need to change: each client launches
+`blindenv mcp` on demand and picks up the new binary automatically.
+
+Vault migrations run automatically the first time a newer version opens the
+vault. They are applied in place and may be irreversible, so export a backup
+before upgrading:
+
+```sh
+BLINDENV_BACKUP_PASSPHRASE='choose-something' blindenv backup export blindenv-backup.bin
+```
+
 ---
 
 ## Quick start
@@ -88,7 +119,9 @@ blindenv ui
 
 # 2. In the dashboard: create a project (e.g. "my-api"),
 #    add an environment (e.g. "staging"), and add your secrets.
-#    Global secrets apply to every environment.
+#    Define a secret as global (all projects), environment-global
+#    (one env, all projects), project-global (all envs of a project)
+#    or project + environment; the most specific definition wins.
 
 # 3. Configure your agent (see below) and let it use the secrets.
 ```
@@ -210,7 +243,7 @@ proxy_http_request(url="https://api.staging.example.com/me",
 
 - **Key management.** A random 32-byte master key lives in the OS keyring. Without a keyring, a passphrase is stretched with Argon2id using a persisted salt. The crypto layer only ever sees the 32-byte key.
 - **Storage.** Each secret value is sealed with AES-256-GCM and a random nonce; project, environment and key names stay readable. Values are only plaintext in memory.
-- **Resolution.** For a `(project, environment)`, the effective value is the environment's own value if present, otherwise the project global.
+- **Resolution.** For a `(project, environment)`, the effective value is chosen by specificity: project + environment, then project-global, then environment-global, then global. When a key is defined in project-global and environment-global at once, project-global wins so a project can always shadow a shared environment default.
 - **MCP tools.** `list_secret_keys` and `get_context` never return values. `proxy_http_request` substitutes `{{SECRET_NAME}}` tags inside BlindEnv and strips secret headers when a redirect crosses hosts. `execute_with_secrets` injects the resolved secrets into a child process, captures stdout/stderr, normalizes the encoding and redacts before returning.
 - **Redaction.** Values are replaced longest-first with `[BLINDENV_REDACTED:KEY]`. Values shorter than 6 characters are not redacted (and are flagged when stored). `BLINDENV_*` variables are stripped from child environments so the master key and passphrase never leak to a command.
 

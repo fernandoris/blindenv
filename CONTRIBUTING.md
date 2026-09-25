@@ -33,17 +33,19 @@ Requires Go 1.24+ (no CGO).
 | --- | --- |
 | `cmd/blindenv` | CLI entrypoint (`mcp`, `ui`, `run`, `backup`, `version`). |
 | `pkg/crypto` | Key providers (keyring, passphrase) and AES-256-GCM. |
-| `pkg/db` | Embedded SQLite repository and the project/environment model. |
+| `pkg/db` | Embedded SQLite repository and the four-tier secret scope model (global, environment-global, project-global, project + environment). |
 | `pkg/mcp` | MCP server, tools, execution, HTTP proxy and redaction. |
 | `pkg/backup` | Passphrase-encrypted vault export/import. |
 | `pkg/web` + `web/` | Local dashboard and its embedded assets. |
 
 ## Design decisions
 
-Significant design decisions live in `openspec/changes/`. The current change,
-`add-blindenv-core`, documents the rationale for the storage model, key
-management, redaction and MCP tool surface. Read it before making architectural
-changes.
+Significant design decisions live in `openspec/changes/`. The change
+`add-blindenv-core` documents the rationale for the storage model, key
+management, redaction and MCP tool surface; `add-shared-scopes` documents the
+four-tier scope model and its precedence. Read them before making architectural
+changes. Resolution order is project + environment > project-global >
+environment-global > global; keep it in one place (`pkg/db/store.go`).
 
 ## Reporting security issues
 

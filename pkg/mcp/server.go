@@ -95,6 +95,14 @@ func (s *Server) audit(ctx context.Context, project, environment, tool string, k
 		ExitCode:    exit,
 		Redactions:  redactions,
 	}
+	if len(keys) > 0 {
+		if scopes, err := s.cfg.Store.EffectiveScopes(ctx, project, environment); err == nil {
+			entry.KeyScopes = make([]db.Scope, 0, len(keys))
+			for _, k := range keys {
+				entry.KeyScopes = append(entry.KeyScopes, scopes[k])
+			}
+		}
+	}
 	if err := s.cfg.Store.AppendAudit(ctx, entry); err != nil {
 		s.logger.Printf("audit error: %v", err)
 	}

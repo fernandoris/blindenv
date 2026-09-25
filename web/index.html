@@ -7,11 +7,39 @@
     <link rel="stylesheet" href="/app.css" />
   </head>
   <body class="min-h-screen bg-slate-900 text-slate-100">
-    <header class="flex items-center justify-between border-b border-slate-700 px-6 py-4">
+    <header class="flex flex-wrap items-center gap-4 border-b border-slate-700 px-6 py-3">
       <h1 class="text-lg font-semibold tracking-tight">BlindEnv</h1>
       <span class="text-xs text-slate-400">local encrypted vault</span>
+      <div class="ml-auto flex items-center gap-3">
+        <input id="filter" type="search" placeholder="Filter scopes and keys  ( / )" aria-label="Filter scopes and keys"
+          class="rounded bg-slate-800 px-3 py-1.5 text-sm outline-none ring-1 ring-slate-700 focus:ring-sky-500" />
+        <button id="activity-btn" type="button" aria-haspopup="dialog" aria-expanded="false"
+          class="rounded bg-slate-800 px-3 py-1.5 text-sm ring-1 ring-slate-700 hover:bg-slate-700">
+          Activity <span id="activity-count" class="ml-1 text-xs text-slate-400">0</span>
+        </button>
+      </div>
     </header>
-    <main id="app" class="mx-auto max-w-5xl p-6"></main>
+
+    <div class="mx-auto grid max-w-6xl gap-6 p-6 md:grid-cols-[16rem_1fr]">
+      <nav id="scope-nav" aria-label="Scopes" class="text-sm"></nav>
+      <main id="editor"></main>
+    </div>
+
+    <div id="toasts" aria-live="polite" class="fixed bottom-4 right-4 z-40 flex flex-col gap-2"></div>
+    <div id="modal-root"></div>
+
+    <div id="activity-drawer" class="fixed inset-0 z-30 hidden" role="dialog" aria-modal="true" aria-label="Recent activity">
+      <div class="absolute inset-0 bg-slate-950/60" data-close-drawer></div>
+      <aside class="absolute right-0 top-0 h-full w-full max-w-2xl overflow-auto border-l border-slate-700 bg-slate-900 p-6">
+        <div class="mb-4 flex items-center justify-between">
+          <h2 class="text-base font-semibold">Recent activity</h2>
+          <button type="button" class="rounded bg-slate-800 px-3 py-1 text-sm hover:bg-slate-700" data-close-drawer>Close</button>
+        </div>
+        <div id="activity-filters" class="mb-3 flex flex-wrap gap-2"></div>
+        <div id="activity-body" class="text-xs"></div>
+      </aside>
+    </div>
+
     <script src="/app.js"></script>
   </body>
 </html>
