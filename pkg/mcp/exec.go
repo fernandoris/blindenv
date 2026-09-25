@@ -1,7 +1,6 @@
 package mcp
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,11 +16,19 @@ import (
 	"github.com/fernandoris/blindenv/pkg/db"
 )
 
-const (
-	execTimeout     = 60 * time.Second
-	maxOutputBytes  = 100_000
-	truncatedSuffix = "\n... [output truncated]"
+var (
+	execTimeout = 60 * time.Second
+	// maxOutputBytes is the retained prefix of a child's output returned to the
+	// model. Capture stops storing beyond this plus the longest secret value,
+	// so memory never grows with the child's total output.
+	maxOutputBytes = 100_000
+	// CommandWaitDelay bounds how long Wait blocks on child I/O after the
+	// process exits or the deadline fires, so a descendant that inherited the
+	// pipes cannot keep the handler blocked.
+	CommandWaitDelay = 2 * time.Second
 )
+
+const truncatedSuffix = "\n... [output truncated]"
 
 type execResult struct {
 	ExitCode   int    `json:"exit_code"`
@@ -56,6 +63,13 @@ func (s *Server) handleExecute(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
+	redactor := NewRedactor(secrets, db.MinSecretLength)
+	// Retain the budget plus the longest value so a value straddling the budget
+	// boundary can still be redacted before the final trim.
+	captureLimit := maxOutputBytes + redactor.MaxValueLen()
+	out := newBoundedWriter(captureLimit)
+	errOut := newBoundedWriter(captureLimit)
+
 	runCtx, cancel := context.WithTimeout(ctx, execTimeout)
 	defer cancel()
 
@@ -65,34 +79,53 @@ func (s *Server) handleExecute(ctx context.Context, req mcp.CallToolRequest) (*m
 	} else {
 		cmd = exec.CommandContext(runCtx, command, args...)
 	}
+	ConfigureProcess(cmd)
+	cmd.Cancel = func() error { return TerminateProcessTree(cmd) }
+	cmd.WaitDelay = CommandWaitDelay
 	cmd.Env = ChildEnv(secrets)
+	cmd.Stdout = out
+	cmd.Stderr = errOut
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	auditCommand := strings.Join(append([]string{command}, args...), " ")
 
-	start := time.Now()
-	runErr := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		s.audit(ctx, project, environment, "execute_with_secrets", keysOf(secrets), auditCommand, nil, 0)
+		return mcp.NewToolResultError(fmt.Sprintf("failed to run command: %v", err)), nil
+	}
+	_ = AfterProcessStart(cmd)
+	runErr := cmd.Wait()
+
+	// Reap descendants that outlived the direct child.
+	_ = TerminateProcessTree(cmd)
+
+	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+		s.audit(ctx, project, environment, "execute_with_secrets", keysOf(secrets), auditCommand, nil, 0)
+		return mcp.NewToolResultError(fmt.Sprintf("command timed out after %s", execTimeout)), nil
+	}
+
 	exitCode := 0
+	// A descendant holding the pipes makes Wait return ErrWaitDelay even when
+	// the command itself exited successfully; treat that as success.
+	if errors.Is(runErr, exec.ErrWaitDelay) {
+		if cmd.ProcessState != nil {
+			exitCode = cmd.ProcessState.ExitCode()
+		}
+		runErr = nil
+	}
 	if runErr != nil {
 		var exitErr *exec.ExitError
 		if errors.As(runErr, &exitErr) {
 			exitCode = exitErr.ExitCode()
-		} else if runCtx.Err() != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("command timed out after %s", execTimeout)), nil
 		} else {
-			s.audit(ctx, project, environment, "execute_with_secrets", keysOf(secrets), strings.Join(append([]string{command}, args...), " "), nil, 0)
+			s.audit(ctx, project, environment, "execute_with_secrets", keysOf(secrets), auditCommand, nil, 0)
 			return mcp.NewToolResultError(fmt.Sprintf("failed to run command: %v", runErr)), nil
 		}
 	}
-	_ = start
 
-	redactor := NewRedactor(secrets, db.MinSecretLength)
-	stdoutText, stdoutRedactions := redactor.Redact(stdout.Bytes())
-	stderrText, stderrRedactions := redactor.Redact(stderr.Bytes())
+	stdoutText, stdoutRedactions := redactor.Redact(out.Bytes())
+	stderrText, stderrRedactions := redactor.Redact(errOut.Bytes())
 	redactions := stdoutRedactions + stderrRedactions
 
-	auditCommand := strings.Join(append([]string{command}, args...), " ")
 	s.audit(ctx, project, environment, "execute_with_secrets", keysOf(secrets), auditCommand, &exitCode, redactions)
 
 	return mcp.NewToolResultJSON(execResult{

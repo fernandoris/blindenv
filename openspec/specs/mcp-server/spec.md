@@ -64,7 +64,7 @@ The Tool SHALL perform HTTP requests substituting `{{SECRET_NAME}}` tags in URL,
 
 ### Requirement: Tool execute_with_secrets
 
-The Tool SHALL run a local subprocess injecting the effective secrets of the resolved project and environment into its environment, capture its output, apply the redaction engine, and return the redacted output along with the exit code. The effective secrets SHALL include the shared scopes when they are not shadowed by a more specific scope.
+The Tool SHALL run a local subprocess injecting the effective secrets of the resolved project and environment into its environment, capture a bounded amount of its output, apply the redaction engine, and return the redacted output along with the exit code. The effective secrets SHALL include the shared scopes when they are not shadowed by a more specific scope. The memory used to capture output MUST NOT grow with the child's total output volume: once a fixed maximum is retained, further bytes MUST be discarded rather than stored. The Tool MUST return within its execution timeout even when the child, or any descendant that inherited its stdout/stderr, keeps those streams open. On completion or timeout the Tool MUST terminate the entire child process tree.
 
 #### Scenario: Project without execution permission
 
@@ -90,6 +90,21 @@ The Tool SHALL run a local subprocess injecting the effective secrets of the res
 
 - **WHEN** the model invokes the Tool with a separate command and arguments
 - **THEN** the system runs the command directly without interpreting it through a shell
+
+#### Scenario: Output larger than the retained maximum
+
+- **WHEN** a command emits far more output than the retention maximum
+- **THEN** the process memory used stays bounded, the response contains the retained prefix with a truncation indicator, and the exit code is reported
+
+#### Scenario: Descendant keeps the stream open
+
+- **WHEN** a command spawns a background descendant that inherits stdout/stderr and the direct child exits
+- **THEN** the Tool terminates the process tree and returns within the execution timeout
+
+#### Scenario: Command exceeds the timeout
+
+- **WHEN** a command keeps running beyond the execution timeout
+- **THEN** the Tool returns a timeout error within the deadline and the child process tree is terminated
 
 ### Requirement: Context pinned in configuration with override
 

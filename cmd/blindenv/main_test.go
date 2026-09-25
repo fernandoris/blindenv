@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fernandoris/blindenv/pkg/mcp"
 )
@@ -127,5 +128,60 @@ func TestRunPropagatesExitCode(t *testing.T) {
 	}
 	if ee.code != 3 {
 		t.Fatalf("exit code = %d, want 3", ee.code)
+	}
+}
+
+// captureStdoutConcurrent pipes stdout to a reader that drains while the
+// function runs, so a child producing more than the pipe buffer cannot block.
+func captureStdoutConcurrent(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	done := make(chan []byte, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- b
+	}()
+	runErr := fn()
+	_ = w.Close()
+	os.Stdout = old
+	return string(<-done), runErr
+}
+
+func TestRunStreamsLargeOutputRedacted(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell loop syntax differs on Windows; streaming is covered elsewhere")
+	}
+	seedVault(t)
+	out, err := captureStdoutConcurrent(t, func() error {
+		return run([]string{"run", "my-api/staging", "--", "sh", "-c",
+			`i=0; while [ $i -lt 5000 ]; do printf '%s padding\n' "$API_KEY"; i=$((i+1)); done`})
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if strings.Contains(out, "sk-cli-abcdef") {
+		t.Fatal("secret leaked from streamed output")
+	}
+	if !strings.Contains(out, "[BLINDENV_REDACTED:API_KEY]") {
+		t.Fatal("expected redaction marker in streamed output")
+	}
+}
+
+func TestRunBackgroundDescendantReturns(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process-group semantics differ on Windows")
+	}
+	seedVault(t)
+	start := time.Now()
+	if err := run([]string{"run", "my-api/staging", "--", "sh", "-c", "sleep 30 & exit 0"}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("run hung on background descendant: %s", elapsed)
 	}
 }

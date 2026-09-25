@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -119,18 +118,31 @@ func cmdRun(vaultPath string, args []string) error {
 	redactor := mcp.NewRedactor(secrets, db.MinSecretLength)
 
 	cmd := exec.CommandContext(ctx, rest[0], rest[1:]...)
+	mcp.ConfigureProcess(cmd)
+	cmd.Cancel = func() error { return mcp.TerminateProcessTree(cmd) }
+	cmd.WaitDelay = mcp.CommandWaitDelay
 	cmd.Env = mcp.ChildEnv(secrets)
 	cmd.Stdin = os.Stdin
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	outRedactor := mcp.NewRedactingWriter(os.Stdout, redactor)
+	errRedactor := mcp.NewRedactingWriter(os.Stderr, redactor)
+	cmd.Stdout = outRedactor
+	cmd.Stderr = errRedactor
 
 	runErr := cmd.Run()
+	_ = mcp.TerminateProcessTree(cmd)
 
-	outText, _ := redactor.Redact(stdout.Bytes())
-	errText, _ := redactor.Redact(stderr.Bytes())
-	fmt.Fprint(os.Stdout, outText)
-	fmt.Fprint(os.Stderr, errText)
+	if closeErr := outRedactor.Close(); closeErr != nil && runErr == nil {
+		runErr = closeErr
+	}
+	if closeErr := errRedactor.Close(); closeErr != nil && runErr == nil {
+		runErr = closeErr
+	}
+
+	// A descendant holding the pipes makes Wait return ErrWaitDelay even when
+	// the command exited successfully; treat that as success.
+	if errors.Is(runErr, exec.ErrWaitDelay) {
+		runErr = nil
+	}
 
 	if runErr != nil {
 		var exitErr *exec.ExitError

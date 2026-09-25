@@ -64,6 +64,19 @@ func (r *Redactor) RedactString(text string) (string, int) {
 	return r.Redact([]byte(text))
 }
 
+// MaxValueLen returns the length of the longest redactable value, or zero when
+// no value is long enough to redact. Entries are sorted longest-first.
+func (r *Redactor) MaxValueLen() int {
+	if len(r.entries) == 0 {
+		return 0
+	}
+	return len(r.entries[0].value)
+}
+
+// utf16HeuristicLimit bounds the speculative BOM-less UTF-16 heuristic so a
+// large buffer is never decoded as UTF-16 and amplified in memory.
+const utf16HeuristicLimit = 1 << 20
+
 // NormalizeUTF8 decodes input to a UTF-8 string, honoring a UTF-8 or UTF-16
 // byte order mark and a heuristic for BOM-less UTF-16LE output (common with
 // Windows PowerShell 5.1).
@@ -75,7 +88,7 @@ func NormalizeUTF8(input []byte) string {
 		return decodeUTF16(input[2:], binary.LittleEndian)
 	case len(input) >= 2 && input[0] == 0xFE && input[1] == 0xFF:
 		return decodeUTF16(input[2:], binary.BigEndian)
-	case looksUTF16LE(input):
+	case len(input) <= utf16HeuristicLimit && looksUTF16LE(input):
 		return decodeUTF16(input, binary.LittleEndian)
 	default:
 		return string(input)
