@@ -41,7 +41,7 @@ In short: **redaction is data-loss prevention, not a security sandbox.** It is d
 
 Additional defaults that reduce risk:
 
-- `execute_with_secrets` is **disabled per project** until you enable `allow_execute`.
+- `execute_with_secrets` is **disabled per project** until you enable `allow_execute`; `get_context` reports whether it is enabled so an agent can see the precondition before calling.
 - `list_secret_keys` returns names only, never values.
 - A per-call audit log records key names, commands and redaction counts — never values.
 
@@ -245,7 +245,7 @@ proxy_http_request(url="https://api.staging.example.com/me",
 - **Key management.** A random 32-byte master key lives in the OS keyring. Without a keyring, a passphrase is stretched with Argon2id using a persisted salt. The crypto layer only ever sees the 32-byte key.
 - **Storage.** Each secret value is sealed with AES-256-GCM and a random nonce; project, environment and key names stay readable. Values are only plaintext in memory.
 - **Resolution.** For a `(project, environment)`, the effective value is chosen by specificity: project + environment, then project-global, then environment-global, then global. When a key is defined in project-global and environment-global at once, project-global wins so a project can always shadow a shared environment default.
-- **MCP tools.** `list_secret_keys` and `get_context` never return values. `proxy_http_request` substitutes `{{SECRET_NAME}}` tags inside BlindEnv and strips secret headers when a redirect crosses hosts. `execute_with_secrets` injects the resolved secrets into a child process, captures stdout/stderr, normalizes the encoding and redacts before returning. Capture retains a bounded prefix (100 KB), so a child's output volume cannot exhaust memory, and the 60 s timeout kills the whole process tree, so a background descendant cannot keep the call open.
+- **MCP tools.** `list_secret_keys` and `get_context` never return values; `get_context` also reports the project's execution capability and, for each key, the source scope that supplied its effective value. `proxy_http_request` substitutes `{{SECRET_NAME}}` tags inside BlindEnv and strips secret headers when a redirect crosses hosts. `execute_with_secrets` injects the resolved secrets into a child process, captures stdout/stderr, normalizes the encoding and redacts before returning. Capture retains a bounded prefix (100 KB), so a child's output volume cannot exhaust memory, and the 60 s timeout kills the whole process tree, so a background descendant cannot keep the call open.
 - **Redaction.** Values are replaced longest-first with `[BLINDENV_REDACTED:KEY]`. Values shorter than 6 characters are not redacted (and are flagged when stored). `BLINDENV_*` variables are stripped from child environments so the master key and passphrase never leak to a command.
 
 ---

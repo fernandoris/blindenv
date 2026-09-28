@@ -6,6 +6,8 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
+
+	"github.com/fernandoris/blindenv/pkg/db"
 )
 
 func (s *Server) registerTools(srv *mcpserver.MCPServer) {
@@ -74,26 +76,49 @@ func (s *Server) handleListSecretKeys(ctx context.Context, req mcp.CallToolReque
 	})
 }
 
+type contextKeyView struct {
+	Key         string   `json:"key"`
+	Scope       string   `json:"scope"`
+	Environment string   `json:"environment,omitempty"`
+	Overrides   []string `json:"overrides,omitempty"`
+}
+
 func (s *Server) handleGetContext(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	project, environment, err := s.resolveContext(req.GetString("project", ""), req.GetString("environment", ""))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	keys, err := s.cfg.Store.ListKeys(ctx, project, environment)
+	proj, err := s.cfg.Store.GetProject(ctx, project)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	if keys == nil {
-		keys = []string{}
+	infos, err := s.cfg.Store.ListSecrets(ctx, project, environment)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	keys := make([]contextKeyView, 0, len(infos))
+	for _, info := range infos {
+		view := contextKeyView{Key: info.Key, Scope: string(info.Scope)}
+		if info.Scope == db.ScopeSharedEnvironment {
+			view.Environment = info.Environment
+		}
+		if len(info.Overrides) > 0 {
+			view.Overrides = make([]string, 0, len(info.Overrides))
+			for _, scope := range info.Overrides {
+				view.Overrides = append(view.Overrides, string(scope))
+			}
+		}
+		keys = append(keys, view)
 	}
 	s.audit(ctx, project, environment, "get_context", nil, "", nil, 0)
 	return mcp.NewToolResultJSON(map[string]any{
-		"os":          runtime.GOOS,
-		"arch":        runtime.GOARCH,
-		"shell_hint":  shellHint(),
-		"project":     project,
-		"environment": environment,
-		"secret_keys": keys,
+		"os":            runtime.GOOS,
+		"arch":          runtime.GOARCH,
+		"shell_hint":    shellHint(),
+		"project":       project,
+		"environment":   environment,
+		"allow_execute": proj.AllowExecute,
+		"secret_keys":   keys,
 	})
 }
 

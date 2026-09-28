@@ -74,8 +74,9 @@ func TestListSecretKeysReturnsNamesOnly(t *testing.T) {
 }
 
 func TestGetContextNoValues(t *testing.T) {
-	srv, _ := newTestServer(t)
-	res, err := srv.handleGetContext(context.Background(), call("get_context", nil))
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	res, err := srv.handleGetContext(ctx, call("get_context", nil))
 	if err != nil {
 		t.Fatalf("handler: %v", err)
 	}
@@ -90,6 +91,107 @@ func TestGetContextNoValues(t *testing.T) {
 	if payload["project"] != "my-api" || payload["environment"] != "staging" {
 		t.Fatalf("context = %v", payload)
 	}
+	if payload["allow_execute"] != false {
+		t.Fatalf("allow_execute = %v, want false", payload["allow_execute"])
+	}
+	keys, ok := payload["secret_keys"].([]any)
+	if !ok || len(keys) == 0 {
+		t.Fatalf("secret_keys = %v, want a non-empty list of objects", payload["secret_keys"])
+	}
+	for _, raw := range keys {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("secret key entry is not an object: %v", raw)
+		}
+		if entry["key"] == nil || entry["scope"] == nil {
+			t.Fatalf("secret key entry missing key/scope: %v", entry)
+		}
+	}
+
+	if err := store.SetAllowExecute(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowExecute: %v", err)
+	}
+	res, err = srv.handleGetContext(ctx, call("get_context", nil))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
+		t.Fatalf("context not JSON: %v", err)
+	}
+	if payload["allow_execute"] != true {
+		t.Fatalf("allow_execute = %v, want true after enabling", payload["allow_execute"])
+	}
+}
+
+func TestGetContextReportsKeyProvenance(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	if _, err := store.PutSecret(ctx, "", "", "GLOBAL_TOKEN", "global-secret-123"); err != nil {
+		t.Fatalf("PutSecret global: %v", err)
+	}
+	if _, err := store.PutSecret(ctx, "", "staging", "SHARED_ENV", "shared-env-secret-123"); err != nil {
+		t.Fatalf("PutSecret shared env: %v", err)
+	}
+	if _, err := store.PutSecret(ctx, "", "", "REGION", "global-region-123"); err != nil {
+		t.Fatalf("PutSecret global REGION: %v", err)
+	}
+
+	res, err := srv.handleGetContext(ctx, call("get_context", nil))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	text := resultText(t, res)
+	for _, value := range []string{"global-secret-123", "shared-env-secret-123", "global-region-123", "sk-abcdef123456", "eu-west-1"} {
+		if strings.Contains(text, value) {
+			t.Fatalf("value %q leaked in %s", value, text)
+		}
+	}
+
+	var payload struct {
+		Keys []struct {
+			Key         string   `json:"key"`
+			Scope       string   `json:"scope"`
+			Environment string   `json:"environment"`
+			Overrides   []string `json:"overrides"`
+		} `json:"secret_keys"`
+	}
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		t.Fatalf("context not JSON: %v", err)
+	}
+	byKey := make(map[string]struct {
+		Scope       string
+		Environment string
+		Overrides   []string
+	}, len(payload.Keys))
+	for _, k := range payload.Keys {
+		byKey[k.Key] = struct {
+			Scope       string
+			Environment string
+			Overrides   []string
+		}{k.Scope, k.Environment, k.Overrides}
+	}
+
+	if got := byKey["GLOBAL_TOKEN"]; got.Scope != "global" || got.Environment != "" {
+		t.Fatalf("GLOBAL_TOKEN = %+v, want scope global without environment", got)
+	}
+	if got := byKey["SHARED_ENV"]; got.Scope != "environment" || got.Environment != "staging" {
+		t.Fatalf("SHARED_ENV = %+v, want scope environment for staging", got)
+	}
+	if got := byKey["API_KEY"]; got.Scope != "project_environment" {
+		t.Fatalf("API_KEY = %+v, want scope project_environment", got)
+	}
+	if got := byKey["REGION"]; got.Scope != "project" || !containsString(got.Overrides, "global") {
+		t.Fatalf("REGION = %+v, want scope project overriding global", got)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestContextOverridePerCall(t *testing.T) {

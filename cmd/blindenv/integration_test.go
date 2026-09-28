@@ -163,6 +163,19 @@ func TestIntegrationMCPFlow(t *testing.T) {
 	if ctxPayload["project"] != "my-api" {
 		t.Fatalf("context project = %v", ctxPayload["project"])
 	}
+	if ctxPayload["allow_execute"] != true {
+		t.Fatalf("context allow_execute = %v, want true", ctxPayload["allow_execute"])
+	}
+	keys, ok := ctxPayload["secret_keys"].([]any)
+	if !ok || len(keys) == 0 {
+		t.Fatalf("context secret_keys = %v, want a non-empty list of objects", ctxPayload["secret_keys"])
+	}
+	for _, raw := range keys {
+		entry, ok := raw.(map[string]any)
+		if !ok || entry["key"] == nil || entry["scope"] == nil {
+			t.Fatalf("context key entry missing key/scope: %v", raw)
+		}
+	}
 
 	// execute_with_secrets: injected and redacted.
 	command, args := echoCommand()
