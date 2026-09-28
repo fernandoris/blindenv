@@ -716,6 +716,72 @@ func (s *Store) ScopeSecrets(ctx context.Context, project, environment string) (
 	return out, nil
 }
 
+// ListScopedKeys returns the key names defined in each scope applicable to a
+// project: the shared global scope, the environment-global scope for every
+// environment name that carries at least one such key, the project-global
+// scope, and the project + environment scope for each of the project's
+// environments. It is independent of any resolved environment and never
+// returns values.
+func (s *Store) ListScopedKeys(ctx context.Context, project string) (ScopedKeys, error) {
+	if _, err := s.projectID(ctx, project); err != nil {
+		return ScopedKeys{}, err
+	}
+	out := ScopedKeys{
+		Environments:        map[string][]string{},
+		ProjectEnvironments: map[string][]string{},
+	}
+
+	globals, err := s.ScopeSecrets(ctx, "", "")
+	if err != nil {
+		return ScopedKeys{}, err
+	}
+	out.Global = keyNamesOf(globals)
+
+	sharedEnvs, err := s.ListSharedEnvironments(ctx)
+	if err != nil {
+		return ScopedKeys{}, err
+	}
+	for _, name := range sharedEnvs {
+		secrets, err := s.ScopeSecrets(ctx, "", name)
+		if err != nil {
+			return ScopedKeys{}, err
+		}
+		if keys := keyNamesOf(secrets); len(keys) > 0 {
+			out.Environments[name] = keys
+		}
+	}
+
+	projectGlobals, err := s.ScopeSecrets(ctx, project, "")
+	if err != nil {
+		return ScopedKeys{}, err
+	}
+	out.Project = keyNamesOf(projectGlobals)
+
+	envs, err := s.ListEnvironments(ctx, project)
+	if err != nil {
+		return ScopedKeys{}, err
+	}
+	for _, e := range envs {
+		secrets, err := s.ScopeSecrets(ctx, project, e.Name)
+		if err != nil {
+			return ScopedKeys{}, err
+		}
+		if keys := keyNamesOf(secrets); len(keys) > 0 {
+			out.ProjectEnvironments[e.Name] = keys
+		}
+	}
+	return out, nil
+}
+
+// keyNamesOf extracts key names from secret metadata, preserving order.
+func keyNamesOf(infos []SecretInfo) []string {
+	names := make([]string, 0, len(infos))
+	for _, info := range infos {
+		names = append(names, info.Key)
+	}
+	return names
+}
+
 // DeleteSecret removes a secret from the given scope.
 func (s *Store) DeleteSecret(ctx context.Context, project, environment, key string) error {
 	pid, env, err := s.resolveScope(ctx, project, environment)

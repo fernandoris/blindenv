@@ -136,7 +136,7 @@ func TestIntegrationMCPFlow(t *testing.T) {
 	for _, tool := range tools.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"list_secret_keys", "get_context", "proxy_http_request", "execute_with_secrets"} {
+	for _, want := range []string{"list_secret_keys", "discover_secrets", "get_context", "proxy_http_request", "execute_with_secrets"} {
 		if !names[want] {
 			t.Fatalf("tool %q missing from %v", want, names)
 		}
@@ -149,6 +149,18 @@ func TestIntegrationMCPFlow(t *testing.T) {
 	}
 	if strings.Contains(listText, itSecret) {
 		t.Fatalf("list leaked a value: %s", listText)
+	}
+
+	// discover_secrets: grouped names across scopes, no values.
+	discoverText := resultText(t, callTool(t, c, "discover_secrets", nil))
+	if !strings.Contains(discoverText, "REGION") || !strings.Contains(discoverText, "API_KEY") {
+		t.Fatalf("discover missing names: %s", discoverText)
+	}
+	if !strings.Contains(discoverText, "project_environment") {
+		t.Fatalf("discover missing scope groups: %s", discoverText)
+	}
+	if strings.Contains(discoverText, itSecret) {
+		t.Fatalf("discover leaked a value: %s", discoverText)
 	}
 
 	// get_context: no values.

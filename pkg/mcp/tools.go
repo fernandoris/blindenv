@@ -12,6 +12,7 @@ import (
 
 func (s *Server) registerTools(srv *mcpserver.MCPServer) {
 	srv.AddTool(listKeysTool(), s.handleListSecretKeys)
+	srv.AddTool(discoverTool(), s.handleDiscoverSecrets)
 	srv.AddTool(getContextTool(), s.handleGetContext)
 	srv.AddTool(proxyTool(), s.handleProxy)
 	srv.AddTool(executeTool(), s.handleExecute)
@@ -22,6 +23,14 @@ func listKeysTool() mcp.Tool {
 		mcp.WithDescription("List the NAMES of secret keys available for a project and environment. Never returns values."),
 		mcp.WithString("project", mcp.Description("Project slug; defaults to the configured project.")),
 		mcp.WithString("environment", mcp.Description("Environment name; defaults to the configured environment.")),
+	)
+}
+
+func discoverTool() mcp.Tool {
+	return mcp.NewTool("discover_secrets",
+		mcp.WithDescription("Discover the NAMES of all secret keys defined for a project, grouped by scope (global, environment, project, project_environment) with the environment name. Independent of the resolved environment and never returns values. Use it before proxy_http_request or execute_with_secrets."),
+		mcp.WithString("project", mcp.Description("Project slug; defaults to the configured project.")),
+		mcp.WithString("environment", mcp.Description("Environment name; optional, echoed in the response.")),
 	)
 }
 
@@ -73,6 +82,28 @@ func (s *Server) handleListSecretKeys(ctx context.Context, req mcp.CallToolReque
 		"project":     project,
 		"environment": environment,
 		"keys":        keys,
+	})
+}
+
+func (s *Server) handleDiscoverSecrets(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project, environment, err := s.resolveContext(req.GetString("project", ""), req.GetString("environment", ""))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	scoped, err := s.cfg.Store.ListScopedKeys(ctx, project)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	s.audit(ctx, project, environment, "discover_secrets", nil, "", nil, 0)
+	return mcp.NewToolResultJSON(map[string]any{
+		"project":     project,
+		"environment": environment,
+		"scopes": map[string]any{
+			"global":              scoped.Global,
+			"environment":         scoped.Environments,
+			"project":             scoped.Project,
+			"project_environment": scoped.ProjectEnvironments,
+		},
 	})
 }
 

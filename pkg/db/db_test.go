@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -534,6 +536,75 @@ func TestScopeSecretsOverrides(t *testing.T) {
 	}
 	if len(globalSecrets[0].Overrides) != 0 {
 		t.Fatalf("global overrides = %v, want none", globalSecrets[0].Overrides)
+	}
+}
+
+func TestListScopedKeysGroups(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	_, _ = s.CreateProject(ctx, "my-api")
+	_, _ = s.CreateEnvironment(ctx, "my-api", "staging")
+
+	_ = put(t, s, "", "", "GLOBAL_KEY", "global-value-123")
+	_ = put(t, s, "", "staging", "SHARED_ENV_KEY", "shared-value-123")
+	_ = put(t, s, "my-api", "", "PROJECT_KEY", "project-value-123")
+	_ = put(t, s, "my-api", "staging", "PROJECT_ENV_KEY", "projectenv-value-123")
+
+	got, err := s.ListScopedKeys(ctx, "my-api")
+	if err != nil {
+		t.Fatalf("ListScopedKeys: %v", err)
+	}
+	if len(got.Global) != 1 || got.Global[0] != "GLOBAL_KEY" {
+		t.Fatalf("global = %v, want [GLOBAL_KEY]", got.Global)
+	}
+	if keys := got.Environments["staging"]; len(keys) != 1 || keys[0] != "SHARED_ENV_KEY" {
+		t.Fatalf("environments = %v, want staging:[SHARED_ENV_KEY]", got.Environments)
+	}
+	if len(got.Project) != 1 || got.Project[0] != "PROJECT_KEY" {
+		t.Fatalf("project = %v, want [PROJECT_KEY]", got.Project)
+	}
+	if keys := got.ProjectEnvironments["staging"]; len(keys) != 1 || keys[0] != "PROJECT_ENV_KEY" {
+		t.Fatalf("project_environments = %v, want staging:[PROJECT_ENV_KEY]", got.ProjectEnvironments)
+	}
+}
+
+func TestListScopedKeysNamesOnly(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	_, _ = s.CreateProject(ctx, "my-api")
+	const value = "topsecret-value-abc"
+	_ = put(t, s, "my-api", "", "PROJECT_KEY", value)
+
+	got, err := s.ListScopedKeys(ctx, "my-api")
+	if err != nil {
+		t.Fatalf("ListScopedKeys: %v", err)
+	}
+	blob := fmt.Sprint(got)
+	if strings.Contains(blob, value) {
+		t.Fatalf("value leaked in %s", blob)
+	}
+	if !strings.Contains(blob, "PROJECT_KEY") {
+		t.Fatalf("key name missing in %s", blob)
+	}
+}
+
+func TestListScopedKeysSharedWithoutProjectEnv(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	_, _ = s.CreateProject(ctx, "my-api")
+	// The project deliberately has no environment named DES.
+	_ = put(t, s, "", "DES", "RANCHER_SCOPE", "rancher-value-123")
+	_ = put(t, s, "", "", "GLOBAL_KEY", "global-value-123")
+
+	got, err := s.ListScopedKeys(ctx, "my-api")
+	if err != nil {
+		t.Fatalf("ListScopedKeys: %v", err)
+	}
+	if keys := got.Environments["DES"]; len(keys) != 1 || keys[0] != "RANCHER_SCOPE" {
+		t.Fatalf("DES shared env = %v, want [RANCHER_SCOPE]", got.Environments)
+	}
+	if len(got.Global) != 1 || got.Global[0] != "GLOBAL_KEY" {
+		t.Fatalf("global = %v, want [GLOBAL_KEY]", got.Global)
 	}
 }
 

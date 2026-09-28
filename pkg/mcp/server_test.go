@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -70,6 +71,120 @@ func TestListSecretKeysReturnsNamesOnly(t *testing.T) {
 	}
 	if strings.Contains(text, "sk-abcdef123456") || strings.Contains(text, "eu-west-1") {
 		t.Fatalf("value leaked in %s", text)
+	}
+}
+
+func TestDiscoverSecrets(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	if _, err := store.PutSecret(ctx, "", "", "GLOBAL_TOKEN", "global-secret-123"); err != nil {
+		t.Fatalf("PutSecret global: %v", err)
+	}
+	if _, err := store.PutSecret(ctx, "", "DES", "RANCHER_SCOPE", "rancher-secret-123"); err != nil {
+		t.Fatalf("PutSecret shared env: %v", err)
+	}
+
+	res, err := srv.handleDiscoverSecrets(ctx, call("discover_secrets", nil))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(t, res))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if payload["project"] != "my-api" {
+		t.Fatalf("project = %v, want my-api", payload["project"])
+	}
+	scopes, ok := payload["scopes"].(map[string]any)
+	if !ok {
+		t.Fatalf("scopes group missing: %v", payload)
+	}
+	assertJSONList(t, scopes["global"], []string{"GLOBAL_TOKEN"})
+	assertJSONList(t, scopes["project"], []string{"REGION"})
+	envs, ok := scopes["environment"].(map[string]any)
+	if !ok {
+		t.Fatalf("environment scope missing: %v", scopes)
+	}
+	assertJSONList(t, envs["DES"], []string{"RANCHER_SCOPE"})
+	projEnvs, ok := scopes["project_environment"].(map[string]any)
+	if !ok {
+		t.Fatalf("project_environment scope missing: %v", scopes)
+	}
+	assertJSONList(t, projEnvs["staging"], []string{"API_KEY"})
+}
+
+func TestDiscoverSecretsIndependentOfEnvironment(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	srv.cfg.Environment = "" // resolved environment is empty
+	if _, err := store.PutSecret(ctx, "", "DES", "RANCHER_SCOPE", "rancher-secret-123"); err != nil {
+		t.Fatalf("PutSecret shared env: %v", err)
+	}
+
+	res, err := srv.handleDiscoverSecrets(ctx, call("discover_secrets", nil))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if payload["environment"] != "" {
+		t.Fatalf("environment = %v, want empty", payload["environment"])
+	}
+	scopes := payload["scopes"].(map[string]any)
+	envs, ok := scopes["environment"].(map[string]any)
+	if !ok {
+		t.Fatalf("environment scope missing: %v", scopes)
+	}
+	assertJSONList(t, envs["DES"], []string{"RANCHER_SCOPE"})
+}
+
+func TestDiscoverSecretsNeverReturnsValues(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	const value = "rancher-secret-xyz"
+	if _, err := store.PutSecret(ctx, "", "DES", "RANCHER_SCOPE", value); err != nil {
+		t.Fatalf("PutSecret: %v", err)
+	}
+	res, err := srv.handleDiscoverSecrets(ctx, call("discover_secrets", nil))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	text := resultText(t, res)
+	if strings.Contains(text, value) {
+		t.Fatalf("value leaked in %s", text)
+	}
+	if strings.Contains(text, "sk-abcdef123456") {
+		t.Fatalf("existing value leaked in %s", text)
+	}
+}
+
+func assertJSONList(t *testing.T, raw any, want []string) {
+	t.Helper()
+	items, ok := raw.([]any)
+	if !ok {
+		t.Fatalf("expected list, got %T (%v)", raw, raw)
+	}
+	if len(items) != len(want) {
+		t.Fatalf("list = %v, want %v", items, want)
+	}
+	for i, w := range want {
+		if items[i] != w {
+			t.Fatalf("list[%d] = %v, want %q", i, items[i], w)
+		}
+	}
+}
+
+func TestInstructionsAdvertiseDiscovery(t *testing.T) {
+	if !strings.Contains(instructions, "discover_secrets") {
+		t.Fatalf("instructions do not advertise discover_secrets: %s", instructions)
+	}
+	if strings.Index(instructions, "discover_secrets") > strings.Index(instructions, "proxy_http_request") {
+		t.Fatalf("discovery not described before secret-consuming tools: %s", instructions)
 	}
 }
 
@@ -385,6 +500,85 @@ func TestProxyCrossHostRedirectStripsAuth(t *testing.T) {
 	}
 	if backendAuth != "" {
 		t.Fatalf("Authorization forwarded across hosts: %q", backendAuth)
+	}
+}
+
+func TestExecuteRequiresEnvironment(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	srv.cfg.Environment = ""
+	if err := store.SetAllowExecute(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowExecute: %v", err)
+	}
+	marker := filepath.Join(t.TempDir(), "should-not-exist")
+	res, err := srv.handleExecute(ctx, call("execute_with_secrets", map[string]any{
+		"command": "sh",
+		"args":    []any{"-c", `touch "$1"`, "sh", marker},
+	}))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected error result, got %s", resultText(t, res))
+	}
+	if !strings.Contains(resultText(t, res), "environment is required") {
+		t.Fatalf("unexpected error: %s", resultText(t, res))
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("subprocess ran despite missing environment")
+	}
+}
+
+func TestProxyRequiresEnvironment(t *testing.T) {
+	var called bool
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer backend.Close()
+
+	srv, _ := newTestServer(t)
+	srv.cfg.Environment = ""
+	res, err := srv.handleProxy(context.Background(), call("proxy_http_request", map[string]any{
+		"url": backend.URL,
+	}))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected error result, got %s", resultText(t, res))
+	}
+	if !strings.Contains(resultText(t, res), "environment is required") {
+		t.Fatalf("unexpected error: %s", resultText(t, res))
+	}
+	if called {
+		t.Fatal("HTTP request issued despite missing environment")
+	}
+}
+
+func TestListingToolsAllowEmptyEnvironment(t *testing.T) {
+	srv, _ := newTestServer(t)
+	ctx := context.Background()
+	srv.cfg.Environment = ""
+	for _, name := range []string{"discover_secrets", "list_secret_keys", "get_context"} {
+		var (
+			res *mcp.CallToolResult
+			err error
+		)
+		switch name {
+		case "discover_secrets":
+			res, err = srv.handleDiscoverSecrets(ctx, call(name, nil))
+		case "list_secret_keys":
+			res, err = srv.handleListSecretKeys(ctx, call(name, nil))
+		case "get_context":
+			res, err = srv.handleGetContext(ctx, call(name, nil))
+		}
+		if err != nil {
+			t.Fatalf("%s handler: %v", name, err)
+		}
+		if res.IsError {
+			t.Fatalf("%s unexpectedly errored: %s", name, resultText(t, res))
+		}
 	}
 }
 

@@ -47,6 +47,21 @@ type SecretInfo struct {
 	Overrides []Scope
 }
 
+// ScopedKeys groups the key names defined in each scope applicable to a
+// project. It never contains values.
+type ScopedKeys struct {
+	// Global is the shared global scope.
+	Global []string
+	// Environments maps an environment name to the keys defined in the
+	// environment-global scope for that name.
+	Environments map[string][]string
+	// Project is the project-global scope.
+	Project []string
+	// ProjectEnvironments maps an environment name to the keys defined in the
+	// project + environment scope for that name.
+	ProjectEnvironments map[string][]string
+}
+
 // AuditEntry records a single MCP tool invocation. It never contains secret
 // values.
 type AuditEntry struct {

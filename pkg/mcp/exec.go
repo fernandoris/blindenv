@@ -38,7 +38,7 @@ type execResult struct {
 }
 
 func (s *Server) handleExecute(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	project, environment, err := s.resolveContext(req.GetString("project", ""), req.GetString("environment", ""))
+	project, environment, err := s.resolveContextForSecrets(req.GetString("project", ""), req.GetString("environment", ""))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
