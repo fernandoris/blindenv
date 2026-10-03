@@ -156,7 +156,15 @@ func openVault(vaultPath string) (*db.Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unlock vault: %w", err)
 	}
-	return db.Open(vaultPath, key)
+	store, err := db.Open(vaultPath, key)
+	if err != nil {
+		return nil, err
+	}
+	if m := store.Migration(); m.From != m.To {
+		fmt.Fprintf(os.Stderr, "blindenv: vault migrated v%d -> v%d; backup at %s\n",
+			m.From, m.To, m.Snapshot)
+	}
+	return store, nil
 }
 
 func splitSelector(selector string) (project, environment string) {

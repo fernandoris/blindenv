@@ -11,10 +11,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -229,4 +231,64 @@ func toAnySlice(in []string) []any {
 		out[i] = s
 	}
 	return out
+}
+
+// syncBuffer is a concurrency-safe writer for capturing subprocess stderr that
+// the transport drains on its own goroutine.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestIntegrationMigrationKeepsStdoutClean verifies that upgrading a legacy
+// vault emits its notice on stderr while stdout stays valid JSON-RPC.
+func TestIntegrationMigrationKeepsStdoutClean(t *testing.T) {
+	bin := buildBinary(t)
+	vault := filepath.Join(t.TempDir(), "vault.db")
+	seedLegacyRawVault(t, vault)
+
+	env := append(os.Environ(),
+		EnvVault+"="+vault,
+		"BLINDENV_PASSPHRASE="+itPassphrase,
+		"BLINDENV_PROJECT=my-api",
+		"BLINDENV_ENV=staging",
+	)
+	var stderr syncBuffer
+	c, err := client.NewStdioMCPClientWithOptions(bin, env, []string{"mcp"},
+		transport.WithCommandStderrWriter(&stderr))
+	if err != nil {
+		t.Fatalf("NewStdioMCPClientWithOptions: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	initReq := mcp.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = mcp.Implementation{Name: "blindenv-integration", Version: "0.1.0"}
+	if _, err := c.Initialize(ctx, initReq); err != nil {
+		t.Fatalf("Initialize after migration: %v", err)
+	}
+	if _, err := c.ListTools(context.Background(), mcp.ListToolsRequest{}); err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+
+	if !strings.Contains(stderr.String(), "migrated v4 -> v5") {
+		t.Fatalf("stderr = %q, want a migration notice", stderr.String())
+	}
+	if _, err := os.Stat(vault + ".v4.bak"); err != nil {
+		t.Fatalf("snapshot missing: %v", err)
+	}
 }

@@ -3,10 +3,23 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"os"
 )
 
 const schemaVersion = 5
+
+// MigrationInfo describes the schema migration performed when a vault was
+// opened. A zero From and To mean no migration was needed.
+type MigrationInfo struct {
+	// From is the schema version the vault had before opening.
+	From int
+	// To is the schema version after opening.
+	To int
+	// Snapshot is the path of the pre-migration copy, empty when none was made.
+	Snapshot string
+}
 
 const baseSchemaSQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -78,6 +91,35 @@ CREATE UNIQUE INDEX IF NOT EXISTS secrets_project_env_idx
 `
 
 func (s *Store) migrate(ctx context.Context) error {
+	// Read the persisted version before any write, so a vault produced by a
+	// newer build is refused without being touched.
+	existed, err := s.tableExists(ctx, "schema_version")
+	if err != nil {
+		return err
+	}
+	stored := 0
+	if existed {
+		stored, err = s.readSchemaVersion(ctx)
+		if err != nil {
+			return err
+		}
+		if stored > schemaVersion {
+			return fmt.Errorf("%w: vault is v%d, this build supports v%d; upgrade blindenv. The vault was not modified",
+				ErrSchemaTooNew, stored, schemaVersion)
+		}
+	}
+
+	// Snapshot a vault that is about to change, before any DDL runs, so the
+	// upgrade can be reversed by restoring the copy.
+	upgrading := existed && stored < schemaVersion
+	snapshot := ""
+	if upgrading {
+		snapshot, err = s.snapshotVault(ctx, stored)
+		if err != nil {
+			return err
+		}
+	}
+
 	if _, err := s.db.ExecContext(ctx, baseSchemaSQL); err != nil {
 		return fmt.Errorf("db: apply base schema: %w", err)
 	}
@@ -124,7 +166,53 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 
-	return s.recordSchemaVersion(ctx)
+	if err := s.recordSchemaVersion(ctx); err != nil {
+		return err
+	}
+	if upgrading {
+		s.migration = MigrationInfo{From: stored, To: schemaVersion, Snapshot: snapshot}
+	}
+	return nil
+}
+
+// readSchemaVersion returns the persisted schema version, or zero when the
+// table exists but holds no row.
+func (s *Store) readSchemaVersion(ctx context.Context) (int, error) {
+	var v int
+	err := s.db.QueryRowContext(ctx, `SELECT version FROM schema_version LIMIT 1`).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("db: read schema version: %w", err)
+	}
+	return v, nil
+}
+
+// snapshotVault writes a consistent, checkpointed copy of the vault beside it
+// so an upgrade can be reversed. It never overwrites an existing snapshot for
+// the same source version. The copy is produced by SQLite, so the vault is
+// never loaded into process memory.
+func (s *Store) snapshotVault(ctx context.Context, from int) (string, error) {
+	if s.path == "" {
+		return "", nil
+	}
+	dest := fmt.Sprintf("%s.v%d.bak", s.path, from)
+	if info, err := os.Stat(dest); err == nil {
+		if info.IsDir() {
+			return "", fmt.Errorf("db: snapshot path %s is a directory", dest)
+		}
+		return dest, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("db: stat snapshot: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `VACUUM INTO ?`, dest); err != nil {
+		return "", fmt.Errorf("db: snapshot vault: %w", err)
+	}
+	if err := os.Chmod(dest, 0o600); err != nil {
+		return "", fmt.Errorf("db: secure snapshot: %w", err)
+	}
+	return dest, nil
 }
 
 // migrateAuditSubstitutions adds the schema-v5 request-side substitution count
@@ -237,7 +325,9 @@ func (s *Store) recordSchemaVersion(ctx context.Context) error {
 		}
 		return nil
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE schema_version SET version = ?`, schemaVersion); err != nil {
+	// Advance only: never lower a version already recorded.
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE schema_version SET version = ? WHERE version < ?`, schemaVersion, schemaVersion); err != nil {
 		return fmt.Errorf("db: update schema_version: %w", err)
 	}
 	return nil

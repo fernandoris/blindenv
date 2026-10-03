@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fernandoris/blindenv/pkg/crypto"
 	"github.com/fernandoris/blindenv/pkg/mcp"
 )
 
@@ -183,5 +185,108 @@ func TestRunBackgroundDescendantReturns(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("run hung on background descendant: %s", elapsed)
+	}
+}
+
+// captureStdStreams replaces both stdout and stderr for the duration of fn.
+func captureStdStreams(t *testing.T, fn func() error) (string, string, error) {
+	t.Helper()
+	oldOut, oldErr := os.Stdout, os.Stderr
+	rOut, wOut, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stdout: %v", err)
+	}
+	rErr, wErr, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stderr: %v", err)
+	}
+	os.Stdout, os.Stderr = wOut, wErr
+	runErr := fn()
+	_ = wOut.Close()
+	_ = wErr.Close()
+	os.Stdout, os.Stderr = oldOut, oldErr
+	out, _ := io.ReadAll(rOut)
+	errOut, _ := io.ReadAll(rErr)
+	return string(out), string(errOut), runErr
+}
+
+// seedLegacyRawVault writes a schema-v4 vault (plus a key salt) so the next
+// open migrates it. Encrypted values are not needed for migration.
+func seedLegacyRawVault(t *testing.T, vault string) {
+	t.Helper()
+	salt, err := crypto.NewSalt(32)
+	if err != nil {
+		t.Fatalf("salt: %v", err)
+	}
+	if err := os.WriteFile(vault+".salt", salt, 0o600); err != nil {
+		t.Fatalf("write salt: %v", err)
+	}
+	raw, err := sql.Open("sqlite", "file:"+vault)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	const seed = `
+CREATE TABLE schema_version (version INTEGER NOT NULL);
+INSERT INTO schema_version (version) VALUES (4);
+CREATE TABLE audit_log (
+	id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, client TEXT NOT NULL DEFAULT '',
+	project TEXT NOT NULL DEFAULT '', environment TEXT NOT NULL DEFAULT '', tool TEXT NOT NULL,
+	key_names TEXT NOT NULL DEFAULT '', key_scopes TEXT NOT NULL DEFAULT '',
+	command TEXT NOT NULL DEFAULT '', exit_code INTEGER,
+	redactions INTEGER NOT NULL DEFAULT 0);
+`
+	if _, err := raw.Exec(seed); err != nil {
+		t.Fatalf("seed legacy: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+}
+
+func TestMigrationNoticeOnStderr(t *testing.T) {
+	dir := t.TempDir()
+	vault := filepath.Join(dir, "vault.db")
+	seedLegacyRawVault(t, vault)
+	t.Setenv(EnvVault, vault)
+	t.Setenv("BLINDENV_PASSPHRASE", "notice-passphrase")
+
+	out, errOut, err := captureStdStreams(t, func() error {
+		store, err := openVault(vault)
+		if err == nil {
+			_ = store.Close()
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatalf("openVault: %v", err)
+	}
+	if out != "" {
+		t.Fatalf("stdout = %q, want empty", out)
+	}
+	if !strings.Contains(errOut, "migrated v4 -> v5") {
+		t.Fatalf("stderr = %q, want a migration notice", errOut)
+	}
+	if _, err := os.Stat(vault + ".v4.bak"); err != nil {
+		t.Fatalf("snapshot missing: %v", err)
+	}
+}
+
+func TestNoMigrationNoticeWhenCurrent(t *testing.T) {
+	seedVault(t)
+	out, errOut, err := captureStdStreams(t, func() error {
+		store, err := openVault(os.Getenv(EnvVault))
+		if err == nil {
+			_ = store.Close()
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatalf("openVault: %v", err)
+	}
+	if out != "" {
+		t.Fatalf("stdout = %q, want empty", out)
+	}
+	if strings.Contains(errOut, "migrated") {
+		t.Fatalf("stderr = %q, want no notice", errOut)
 	}
 }

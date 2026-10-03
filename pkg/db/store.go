@@ -31,6 +31,10 @@ var (
 	// ErrInvalidMetadata is returned for an unknown type, an over-long hint, a
 	// hint that contains the value, or a non-sensitive token/password.
 	ErrInvalidMetadata = errors.New("db: invalid metadata")
+	// ErrSchemaTooNew is returned when the vault was created or migrated by a
+	// newer BlindEnv whose schema this build does not understand. The vault is
+	// left untouched.
+	ErrSchemaTooNew = errors.New("db: vault schema is newer than this build supports")
 )
 
 func boolToInt(v bool) int {
@@ -76,9 +80,15 @@ func validateHint(meta SecretMeta, value string) error {
 
 // Store is the encrypted secret repository backed by embedded SQLite.
 type Store struct {
-	db  *sql.DB
-	key []byte
+	db        *sql.DB
+	key       []byte
+	path      string
+	migration MigrationInfo
 }
+
+// Migration reports the schema migration performed when the vault was opened.
+// A zero value means no migration was needed.
+func (s *Store) Migration() MigrationInfo { return s.migration }
 
 // Open opens (creating if needed) the vault at path and returns a Store that
 // encrypts and decrypts values with the given master key.
@@ -99,7 +109,7 @@ func Open(path string, key []byte) (*Store, error) {
 		_ = sqlDB.Close()
 		return nil, fmt.Errorf("db: ping %s: %w", path, err)
 	}
-	s := &Store{db: sqlDB, key: key}
+	s := &Store{db: sqlDB, key: key, path: path}
 	if err := s.migrate(context.Background()); err != nil {
 		_ = sqlDB.Close()
 		return nil, err

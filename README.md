@@ -110,11 +110,25 @@ needed. Configured agents do not need to change: each client launches
 `blindenv mcp` on demand and picks up the new binary automatically.
 
 Vault migrations run automatically the first time a newer version opens the
-vault. They are applied in place and may be irreversible, so export a backup
-before upgrading:
+vault. They are forward-only and safe to run unattended:
+
+- Before changing anything, BlindEnv writes a **pre-migration snapshot** of the
+  vault next to it, for example `vault.db.v3.bak`. It is an encrypted copy, so
+  it needs no passphrase and protects secrets exactly like the vault itself.
+- When a migration runs, BlindEnv prints a single line to **standard error**,
+  for example `blindenv: vault migrated v3 -> v5; backup at /…/vault.db.v3.bak`.
+  Standard output is never touched, so MCP clients are unaffected.
+- If the vault was created by a **newer** BlindEnv, an older binary refuses to
+  open it and reports that the vault schema is newer than the build supports,
+  leaving the vault unmodified. Upgrade the binary to continue.
+
+To undo an upgrade (downgrade), stop every BlindEnv process and restore the
+snapshot over the vault, removing any stale Write-Ahead Log sidecars, then run
+the binary whose schema matches the restored vault:
 
 ```sh
-BLINDENV_BACKUP_PASSPHRASE='choose-something' blindenv backup export blindenv-backup.bin
+mv vault.db.v3.bak vault.db
+rm -f vault.db-wal vault.db-shm
 ```
 
 ---
