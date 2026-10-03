@@ -218,6 +218,7 @@ type envView struct {
 type projectView struct {
 	Slug         string       `json:"slug"`
 	AllowExecute bool         `json:"allow_execute"`
+	AllowOpen    bool         `json:"allow_open"`
 	Globals      []secretView `json:"globals"`
 	Environments []envView    `json:"environments"`
 }
@@ -298,7 +299,7 @@ func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]projectView, 0, len(projects))
 	for _, p := range projects {
-		pv := projectView{Slug: p.Slug, AllowExecute: p.AllowExecute, Globals: []secretView{}, Environments: []envView{}}
+		pv := projectView{Slug: p.Slug, AllowExecute: p.AllowExecute, AllowOpen: p.AllowOpen, Globals: []secretView{}, Environments: []envView{}}
 		globals, err := s.scopeSecretViews(ctx, p.Slug, "")
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -451,6 +452,19 @@ func (s *server) handleProjectSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"allow_execute": body.Allow})
+
+	case len(parts) == 2 && parts[1] == "allow-open" && r.Method == http.MethodPost:
+		var body struct {
+			Allow bool `json:"allow"`
+		}
+		if !readJSON(w, r, &body) {
+			return
+		}
+		if err := s.store.SetAllowOpen(ctx, slug, body.Allow); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"allow_open": body.Allow})
 
 	case len(parts) == 2 && parts[1] == "secrets" && r.Method == http.MethodPost:
 		var body struct {

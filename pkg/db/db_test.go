@@ -187,6 +187,101 @@ func TestAllowExecuteToggle(t *testing.T) {
 	}
 }
 
+func TestAllowOpenIndependentOfExecute(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	if _, err := s.CreateProject(ctx, "my-api"); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+
+	p, err := s.GetProject(ctx, "my-api")
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	if p.AllowOpen {
+		t.Fatal("allow_open should default to disabled")
+	}
+
+	if err := s.SetAllowOpen(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowOpen: %v", err)
+	}
+	p, err = s.GetProject(ctx, "my-api")
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	if !p.AllowOpen {
+		t.Fatal("allow_open not persisted")
+	}
+	if p.AllowExecute {
+		t.Fatal("toggling allow_open changed allow_execute")
+	}
+
+	if err := s.SetAllowExecute(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowExecute: %v", err)
+	}
+	p, err = s.GetProject(ctx, "my-api")
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	if !p.AllowOpen || !p.AllowExecute {
+		t.Fatalf("flags not independent: allow_open=%v allow_execute=%v", p.AllowOpen, p.AllowExecute)
+	}
+
+	projects, err := s.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("ListProjects: %v", err)
+	}
+	if len(projects) != 1 || !projects[0].AllowOpen {
+		t.Fatalf("ListProjects allow_open = %+v", projects)
+	}
+}
+
+func TestMigrateAllowOpenDefaultsDisabled(t *testing.T) {
+	key, err := crypto.NewSalt(crypto.KeySize)
+	if err != nil {
+		t.Fatalf("key: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "vault.db")
+
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	// Schema v3: projects has allow_execute but no allow_open.
+	v3 := `
+CREATE TABLE schema_version (version INTEGER NOT NULL);
+INSERT INTO schema_version (version) VALUES (3);
+CREATE TABLE projects (
+	id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE,
+	allow_execute INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+INSERT INTO projects (slug, allow_execute, created_at) VALUES ('my-api', 1, '2026-01-01T00:00:00Z');
+`
+	if _, err := raw.Exec(v3); err != nil {
+		t.Fatalf("seed v3: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	s, err := Open(path, key)
+	if err != nil {
+		t.Fatalf("Open migrated: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	p, err := s.GetProject(ctx, "my-api")
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	if p.AllowOpen {
+		t.Fatal("allow_open should be disabled after migration")
+	}
+	if !p.AllowExecute {
+		t.Fatal("migration clobbered allow_execute")
+	}
+}
+
 func TestAuditLog(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()

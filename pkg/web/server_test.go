@@ -134,6 +134,28 @@ func TestAllowExecuteAndAuditAPI(t *testing.T) {
 	}
 }
 
+func TestAllowOpenIndependentOfExecuteAPI(t *testing.T) {
+	_, store, mux := newTestWeb(t)
+	ctx := context.Background()
+	_, _ = store.CreateProject(ctx, "my-api")
+
+	if got := do(t, mux, http.MethodPost, "/api/projects/my-api/allow-open", `{"allow":true}`, testToken, "").Code; got != http.StatusOK {
+		t.Fatalf("allow-open status = %d", got)
+	}
+	p, _ := store.GetProject(ctx, "my-api")
+	if !p.AllowOpen {
+		t.Fatal("allow_open not persisted")
+	}
+	if p.AllowExecute {
+		t.Fatal("toggling allow_open changed allow_execute")
+	}
+
+	state := do(t, mux, http.MethodGet, "/api/projects", "", testToken, "")
+	if state.Code != http.StatusOK || !strings.Contains(state.Body.String(), `"allow_open":true`) {
+		t.Fatalf("state = %d %s", state.Code, state.Body.String())
+	}
+}
+
 func TestDevAssets(t *testing.T) {
 	t.Chdir("../..")
 	s, _, _ := newTestWeb(t)

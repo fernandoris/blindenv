@@ -70,7 +70,7 @@ The Tool SHALL return the NAMES of the secret keys available to the resolved pro
 
 ### Requirement: Tool get_context
 
-The Tool SHALL return the execution context: operating system, architecture, shell hint, the resolved shell's secret reference, active project and environment, whether execution with secrets is enabled for the resolved project, and the effective keys with the source scope that supplied each value. For each key it SHALL report its type, its hint when present, and whether it is non-sensitive, alongside the source-scope information. The secret reference SHALL report the canonical tag `{{SECRET_NAME}}` and the native environment reference for that shell (`${env:NAME}` for PowerShell/pwsh, `%NAME%` for cmd, `${NAME}` for POSIX shells). The Tool SHALL accept an optional `shell` argument and SHALL default to the OS shell when it is not provided. For each key it SHALL report one of the four scopes (`global`, `environment`, `project`, `project_environment`), the environment name when the source scope is environment-specific, and the broader scopes the definition shadows. The Tool SHALL return the value of a key only when that key's effective definition is non-sensitive; it MUST NOT return the value of a sensitive key.
+The Tool SHALL return the execution context: operating system, architecture, shell hint, the resolved shell's secret reference, active project and environment, whether execution with secrets is enabled for the resolved project, whether opening a URL in the browser is enabled for the resolved project, and the effective keys with the source scope that supplied each value. For each key it SHALL report its type, its hint when present, and whether it is non-sensitive, alongside the source-scope information. The secret reference SHALL report the canonical tag `{{SECRET_NAME}}` and the native environment reference for that shell (`${env:NAME}` for PowerShell/pwsh, `%NAME%` for cmd, `${NAME}` for POSIX shells). The Tool SHALL accept an optional `shell` argument and SHALL default to the OS shell when it is not provided. For each key it SHALL report one of the four scopes (`global`, `environment`, `project`, `project_environment`), the environment name when the source scope is environment-specific, and the broader scopes the definition shadows. The Tool SHALL return the value of a key only when that key's effective definition is non-sensitive; it MUST NOT return the value of a sensitive key.
 
 #### Scenario: Context without values
 
@@ -96,6 +96,11 @@ The Tool SHALL return the execution context: operating system, architecture, she
 
 - **WHEN** the model invokes `get_context` for a project whose `allow_execute` is disabled or enabled
 - **THEN** the response reports the matching execution capability for that project, before the model attempts `execute_with_secrets`
+
+#### Scenario: Browser capability reported
+
+- **WHEN** the model invokes `get_context` for a project whose `allow_open` is disabled or enabled
+- **THEN** the response reports the matching browser-open capability for that project, before the model attempts `open_in_browser`
 
 #### Scenario: Shared key source reported
 
@@ -200,6 +205,57 @@ The Tool SHALL run a local subprocess injecting the effective secrets of the res
 - **WHEN** a command contains a matching tag and the resolved shell is unknown or empty
 - **THEN** the Tool refuses with an error explaining that a shell is required to translate the tag, without running the command
 
+### Requirement: Tool open_in_browser
+
+The Tool SHALL resolve `{{SECRET_NAME}}` tags in a URL inside BlindEnv using the secrets of the resolved project and environment, then hand the resolved URL to the operating system's default browser launcher. It SHALL accept an optional `url` (required), `project` and `environment`. It SHALL require a non-empty environment like the other secret-consuming Tools. It SHALL invoke the launcher directly, without a shell. A `{{SECRET_NAME}}` tag that does not name an effective key SHALL pass through unchanged. The Tool SHALL report only that the URL was handed to the launcher and MUST NOT return any part of the resolved URL or any secret value.
+
+#### Scenario: Sensitive tag resolved for the browser
+
+- **WHEN** the model opens a URL containing `{{SSO_TOKEN}}` and `SSO_TOKEN` is an effective sensitive key
+- **THEN** the launcher receives the URL with the value substituted and the model never receives it
+
+#### Scenario: Non-matching tag passes through
+
+- **WHEN** a URL contains a `{{...}}` tag whose name is not an effective key
+- **THEN** the tag is left unchanged in the URL handed to the launcher
+
+#### Scenario: Empty environment refused
+
+- **WHEN** the model invokes `open_in_browser` and neither the call nor the pinned configuration provides an environment
+- **THEN** the system refuses with an error explaining that an environment is required, without launching the browser
+
+#### Scenario: Result contains no URL
+
+- **WHEN** the Tool returns to the model
+- **THEN** the response reports that the URL was handed to the launcher and contains no part of the resolved URL or any secret value
+
+### Requirement: open_in_browser requires the allow_open capability
+
+The Tool SHALL refuse to open a URL for a project whose `allow_open` capability is disabled, without launching the browser or substituting any secret, and SHALL explain how to enable the capability.
+
+#### Scenario: Disabled capability refused
+
+- **WHEN** the model invokes `open_in_browser` on a project with `allow_open` disabled
+- **THEN** the system refuses with an error explaining how to enable it without launching the browser
+
+### Requirement: No display refused on Linux
+
+On Linux, when neither `DISPLAY` nor `WAYLAND_DISPLAY` is set, the Tool SHALL refuse with an actionable error explaining that no graphical session was detected, instead of blocking or failing opaquely.
+
+#### Scenario: Headless Linux refused
+
+- **WHEN** the model invokes `open_in_browser` on Linux with no display available
+- **THEN** the system refuses with an error explaining that no display was detected and launches nothing
+
+### Requirement: Audit of browser opens records only the template
+
+The server SHALL log an `open_in_browser` invocation with timestamp, project, environment, Tool name, the names of the keys used with their source scopes, and the **unsubstituted URL template**. The audit entry MUST NOT contain the resolved URL or any secret value.
+
+#### Scenario: Audit stores the template
+
+- **WHEN** the model opens a URL containing `{{SSO_TOKEN}}`
+- **THEN** the audit entry stores the URL with `{{SSO_TOKEN}}` intact and never the resolved value
+
 ### Requirement: Discovery phase in server guidance
 
 The server SHALL advertise a discovery-first workflow in its MCP instructions: the model discovers available keys with `discover_secrets`, then selects a project and environment and reads the shell's secret reference from `get_context`, then uses secrets through `proxy_http_request` or `execute_with_secrets`.
@@ -216,7 +272,7 @@ The server SHALL advertise a discovery-first workflow in its MCP instructions: t
 
 ### Requirement: Context pinned in configuration with override
 
-The server SHALL take the project and environment from the MCP client configuration when the Tool does not receive them, and SHALL allow overriding them per call when provided. The server MUST require a non-empty resolved environment for the secret-consuming tools (`proxy_http_request` and `execute_with_secrets`); a call that resolves to an empty environment SHALL be refused with an error explaining that an environment is required. The discovery and listing tools (`discover_secrets`, `list_secret_keys`, `get_context`) SHALL NOT require an environment.
+The server SHALL take the project and environment from the MCP client configuration when the Tool does not receive them, and SHALL allow overriding them per call when provided. The server MUST require a non-empty resolved environment for the secret-consuming tools (`proxy_http_request`, `execute_with_secrets` and `open_in_browser`); a call that resolves to an empty environment SHALL be refused with an error explaining that an environment is required. The discovery and listing tools (`discover_secrets`, `list_secret_keys`, `get_context`) SHALL NOT require an environment.
 
 #### Scenario: Using the pinned context
 
@@ -230,8 +286,8 @@ The server SHALL take the project and environment from the MCP client configurat
 
 #### Scenario: Empty environment refused for secret-consuming tools
 
-- **WHEN** the model invokes `proxy_http_request` or `execute_with_secrets` and neither the call nor the pinned configuration provides an environment
-- **THEN** the system refuses the call with an error explaining that an environment is required, without performing the request or running any command
+- **WHEN** the model invokes `proxy_http_request`, `execute_with_secrets` or `open_in_browser` and neither the call nor the pinned configuration provides an environment
+- **THEN** the system refuses the call with an error explaining that an environment is required, without performing the request, running any command or launching the browser
 
 #### Scenario: Listing tools allow an empty environment
 

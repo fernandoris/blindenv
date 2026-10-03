@@ -34,6 +34,9 @@ func seed(t *testing.T, store *db.Store) {
 	if err := store.SetAllowExecute(ctx, "my-api", true); err != nil {
 		t.Fatalf("SetAllowExecute: %v", err)
 	}
+	if err := store.SetAllowOpen(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowOpen: %v", err)
+	}
 	if _, err := store.CreateEnvironment(ctx, "my-api", "staging"); err != nil {
 		t.Fatalf("CreateEnvironment: %v", err)
 	}
@@ -73,6 +76,9 @@ func TestExportImportRoundTrip(t *testing.T) {
 	}
 	if !p.AllowExecute {
 		t.Fatal("allow_execute not restored")
+	}
+	if !p.AllowOpen {
+		t.Fatal("allow_open not restored")
 	}
 }
 

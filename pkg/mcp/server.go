@@ -71,6 +71,8 @@ const instructions = "BlindEnv gives you access to dev/pre-prod secrets without 
 	"Use proxy_http_request for HTTP calls with {{SECRET_NAME}} substitution, or execute_with_secrets to run " +
 	"commands with secrets injected; both require an explicit environment, and in a command {{SECRET_NAME}} is " +
 	"translated to the shell's native environment reference so the value is never placed on the command line. " +
+	"Use open_in_browser to hand a URL with {{SECRET_NAME}} substitution to the local default browser, when the " +
+	"project enables it. " +
 	"Use list_secret_keys for the effective keys of the resolved context and get_context for the active OS, " +
 	"project and execution capability. Never try to print or echo a secret value."
 

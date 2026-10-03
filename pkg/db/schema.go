@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 const baseSchemaSQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS projects (
 	id            INTEGER PRIMARY KEY AUTOINCREMENT,
 	slug          TEXT    NOT NULL UNIQUE,
 	allow_execute INTEGER NOT NULL DEFAULT 0,
+	allow_open    INTEGER NOT NULL DEFAULT 0,
 	created_at    TEXT    NOT NULL
 );
 
@@ -104,6 +105,10 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 
+	if err := s.migrateAllowOpen(ctx); err != nil {
+		return err
+	}
+
 	hasKeyScopes, err := s.columnExists(ctx, "audit_log", "key_scopes")
 	if err != nil {
 		return err
@@ -140,6 +145,24 @@ func (s *Store) migrateSecretsMetadata(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("db: add secret metadata: %w", err)
 		}
+	}
+	return nil
+}
+
+// migrateAllowOpen adds the schema-v4 per-project browser-open capability to an
+// existing projects table. It is additive; existing projects default to
+// disabled, so opening a URL requires an explicit opt-in after upgrade.
+func (s *Store) migrateAllowOpen(ctx context.Context) error {
+	hasAllowOpen, err := s.columnExists(ctx, "projects", "allow_open")
+	if err != nil {
+		return err
+	}
+	if hasAllowOpen {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`ALTER TABLE projects ADD COLUMN allow_open INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return fmt.Errorf("db: add allow_open: %w", err)
 	}
 	return nil
 }

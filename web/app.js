@@ -265,6 +265,10 @@ function renderEditor() {
       <input type="checkbox" id="allow-execute" ${view.allowExecute ? "checked" : ""} />
       allow execute
     </label>`}
+    ${view.allowOpen === null ? "" : `<label class="flex items-center gap-2 text-sm text-slate-300" title="Lets an agent hand a resolved URL to the local default browser">
+      <input type="checkbox" id="allow-open" ${view.allowOpen ? "checked" : ""} />
+      allow open in browser
+    </label>`}
     <button type="button" id="add-secret" class="rounded bg-sky-600 px-3 py-1.5 text-sm font-medium hover:bg-sky-500 md:ml-auto">+ Add secret</button>
   </div>`);
   editor.appendChild(header);
@@ -273,6 +277,16 @@ function renderEditor() {
     header.querySelector("#allow-execute").onchange = (e) => {
       action(() =>
         api(`/api/projects/${enc(selected.project)}/allow-execute`, {
+          method: "POST",
+          body: JSON.stringify({ allow: e.target.checked }),
+        })
+      );
+    };
+  }
+  if (view.allowOpen !== null) {
+    header.querySelector("#allow-open").onchange = (e) => {
+      action(() =>
+        api(`/api/projects/${enc(selected.project)}/allow-open`, {
           method: "POST",
           body: JSON.stringify({ allow: e.target.checked }),
         })
@@ -345,6 +359,7 @@ function describeScope(s) {
       inherited: [],
       effective: null,
       allowExecute: null,
+      allowOpen: null,
     };
   }
   if (s.kind === "shared_env") {
@@ -356,10 +371,11 @@ function describeScope(s) {
       inherited: state.shared.global.map((x) => ({ ...x, source: "global" })),
       effective: null,
       allowExecute: null,
+      allowOpen: null,
     };
   }
   const p = state.projects.find((x) => x.slug === s.project);
-  if (!p) return { title: s.project, subtitle: "", defined: [], inherited: [], effective: null, allowExecute: false };
+  if (!p) return { title: s.project, subtitle: "", defined: [], inherited: [], effective: null, allowExecute: false, allowOpen: false };
   if (s.kind === "project") {
     return {
       title: `${p.slug} (all environments)`,
@@ -368,6 +384,7 @@ function describeScope(s) {
       inherited: state.shared.global.map((x) => ({ ...x, source: "global" })),
       effective: null,
       allowExecute: p.allow_execute,
+      allowOpen: p.allow_open,
     };
   }
   const env = p.environments.find((e) => e.name === s.environment);
@@ -378,6 +395,7 @@ function describeScope(s) {
     inherited: env ? inheritedForEnv(env) : [],
     effective: env ? env.effective : [],
     allowExecute: p.allow_execute,
+    allowOpen: p.allow_open,
   };
 }
 

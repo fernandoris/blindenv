@@ -59,6 +59,7 @@ type Project struct {
 	ID           int64
 	Slug         string
 	AllowExecute bool
+	AllowOpen    bool
 	CreatedAt    time.Time
 }
 

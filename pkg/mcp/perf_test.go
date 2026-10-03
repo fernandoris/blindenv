@@ -21,3 +21,21 @@ func BenchmarkRedactorMixedSensitivity(b *testing.B) {
 		_, _ = r.RedactString(payload)
 	}
 }
+
+// BenchmarkSubstituteURL measures the only non-trivial work open_in_browser
+// does before handing the URL to the OS launcher: in-process {{KEY}}
+// substitution. The launcher spawn itself is a fixed os/exec cost and is not
+// meaningfully representable in a Go benchmark, so this bounds the
+// BlindEnv-owned portion of the open path.
+func BenchmarkSubstituteURL(b *testing.B) {
+	secrets := map[string]string{
+		"SSO_TOKEN": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abcdef",
+		"CLIENT_ID": "9f8e7d6c5b4a",
+		"REGION":    "eu-west-1",
+	}
+	url := "https://idp.example.test/authorize?client={{CLIENT_ID}}&token={{SSO_TOKEN}}&region={{REGION}}&redirect=/home"
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = substitute(url, secrets)
+	}
+}

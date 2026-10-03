@@ -18,6 +18,7 @@ func (s *Server) registerTools(srv *mcpserver.MCPServer) {
 	srv.AddTool(getContextTool(), s.handleGetContext)
 	srv.AddTool(proxyTool(), s.handleProxy)
 	srv.AddTool(executeTool(), s.handleExecute)
+	srv.AddTool(openTool(), s.handleOpen)
 }
 
 func listKeysTool() mcp.Tool {
@@ -63,6 +64,15 @@ func executeTool() mcp.Tool {
 		mcp.WithString("command", mcp.Required(), mcp.Description("Executable to run, or a script when shell is set.")),
 		mcp.WithArray("args", mcp.Description("Arguments passed to the command."), mcp.WithStringItems()),
 		mcp.WithString("shell", mcp.Description("Optional shell to run the command with (bash, powershell, cmd, ...).")),
+		mcp.WithString("project", mcp.Description("Project slug; defaults to the configured project.")),
+		mcp.WithString("environment", mcp.Description("Environment name; defaults to the configured environment.")),
+	)
+}
+
+func openTool() mcp.Tool {
+	return mcp.NewTool("open_in_browser",
+		mcp.WithDescription("Open a URL in the local default browser, substituting {{SECRET_NAME}} tags inside BlindEnv. The resolved URL is handed to the OS launcher and never returned to you. Requires allow_open on the project."),
+		mcp.WithString("url", mcp.Required(), mcp.Description("URL to open; may contain {{SECRET_NAME}}.")),
 		mcp.WithString("project", mcp.Description("Project slug; defaults to the configured project.")),
 		mcp.WithString("environment", mcp.Description("Environment name; defaults to the configured environment.")),
 	)
@@ -203,6 +213,7 @@ func (s *Server) handleGetContext(ctx context.Context, req mcp.CallToolRequest) 
 			"tag":    "{{SECRET_NAME}}",
 		},
 		"allow_execute": proj.AllowExecute,
+		"allow_open":    proj.AllowOpen,
 		"secret_keys":   keys,
 	})
 }

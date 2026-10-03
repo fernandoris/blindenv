@@ -144,13 +144,14 @@ func (s *Store) CreateProject(ctx context.Context, slug string) (Project, error)
 // GetProject returns a project by slug.
 func (s *Store) GetProject(ctx context.Context, slug string) (Project, error) {
 	var (
-		p       Project
-		allow   int
-		created string
+		p         Project
+		allow     int
+		allowOpen int
+		created   string
 	)
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, slug, allow_execute, created_at FROM projects WHERE slug = ?`, slug).
-		Scan(&p.ID, &p.Slug, &allow, &created)
+		`SELECT id, slug, allow_execute, allow_open, created_at FROM projects WHERE slug = ?`, slug).
+		Scan(&p.ID, &p.Slug, &allow, &allowOpen, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Project{}, ErrProjectNotFound
 	}
@@ -158,6 +159,7 @@ func (s *Store) GetProject(ctx context.Context, slug string) (Project, error) {
 		return Project{}, fmt.Errorf("db: get project: %w", err)
 	}
 	p.AllowExecute = allow != 0
+	p.AllowOpen = allowOpen != 0
 	p.CreatedAt = parseTime(created)
 	return p, nil
 }
@@ -165,7 +167,7 @@ func (s *Store) GetProject(ctx context.Context, slug string) (Project, error) {
 // ListProjects returns all projects ordered by slug.
 func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, slug, allow_execute, created_at FROM projects ORDER BY slug`)
+		`SELECT id, slug, allow_execute, allow_open, created_at FROM projects ORDER BY slug`)
 	if err != nil {
 		return nil, fmt.Errorf("db: list projects: %w", err)
 	}
@@ -173,14 +175,16 @@ func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
 	var out []Project
 	for rows.Next() {
 		var (
-			p       Project
-			allow   int
-			created string
+			p         Project
+			allow     int
+			allowOpen int
+			created   string
 		)
-		if err := rows.Scan(&p.ID, &p.Slug, &allow, &created); err != nil {
+		if err := rows.Scan(&p.ID, &p.Slug, &allow, &allowOpen, &created); err != nil {
 			return nil, err
 		}
 		p.AllowExecute = allow != 0
+		p.AllowOpen = allowOpen != 0
 		p.CreatedAt = parseTime(created)
 		out = append(out, p)
 	}
@@ -209,6 +213,22 @@ func (s *Store) SetAllowExecute(ctx context.Context, slug string, allow bool) er
 	res, err := s.db.ExecContext(ctx, `UPDATE projects SET allow_execute = ? WHERE slug = ?`, value, slug)
 	if err != nil {
 		return fmt.Errorf("db: set allow_execute: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrProjectNotFound
+	}
+	return nil
+}
+
+// SetAllowOpen enables or disables opening URLs in the browser for a project.
+func (s *Store) SetAllowOpen(ctx context.Context, slug string, allow bool) error {
+	value := 0
+	if allow {
+		value = 1
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE projects SET allow_open = ? WHERE slug = ?`, value, slug)
+	if err != nil {
+		return fmt.Errorf("db: set allow_open: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrProjectNotFound

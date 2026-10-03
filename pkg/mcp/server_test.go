@@ -289,6 +289,40 @@ func TestGetContextNoValues(t *testing.T) {
 	}
 }
 
+func TestGetContextReportsAllowOpen(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	res, err := srv.handleGetContext(ctx, call("get_context", nil))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
+		t.Fatalf("context not JSON: %v", err)
+	}
+	if payload["allow_open"] != false {
+		t.Fatalf("allow_open = %v, want false by default", payload["allow_open"])
+	}
+
+	if err := store.SetAllowOpen(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowOpen: %v", err)
+	}
+	res, err = srv.handleGetContext(ctx, call("get_context", nil))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
+		t.Fatalf("context not JSON: %v", err)
+	}
+	if payload["allow_open"] != true {
+		t.Fatalf("allow_open = %v, want true after enabling", payload["allow_open"])
+	}
+	// Enabling allow_open must not change allow_execute.
+	if payload["allow_execute"] != false {
+		t.Fatalf("allow_execute = %v, want false", payload["allow_execute"])
+	}
+}
+
 func TestGetContextReportsKeyProvenance(t *testing.T) {
 	srv, store := newTestServer(t)
 	ctx := context.Background()

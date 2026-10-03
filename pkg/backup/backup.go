@@ -37,6 +37,7 @@ type data struct {
 type project struct {
 	Slug         string            `json:"slug"`
 	AllowExecute bool              `json:"allow_execute"`
+	AllowOpen    bool              `json:"allow_open,omitempty"`
 	Globals      map[string]string `json:"globals"`
 	Metadata     map[string]meta   `json:"metadata,omitempty"`
 	Environments []environment     `json:"environments"`
@@ -148,6 +149,9 @@ func Import(ctx context.Context, store *db.Store, passphrase string, blob []byte
 		if err := store.SetAllowExecute(ctx, p.Slug, p.AllowExecute); err != nil {
 			return err
 		}
+		if err := store.SetAllowOpen(ctx, p.Slug, p.AllowOpen); err != nil {
+			return err
+		}
 		for key, value := range p.Globals {
 			if _, err := store.PutSecretMeta(ctx, p.Slug, "", key, value, p.Metadata[key].secretMeta()); err != nil {
 				return err
@@ -196,6 +200,7 @@ func snapshotData(ctx context.Context, store *db.Store) (*data, error) {
 		entry := project{
 			Slug:         p.Slug,
 			AllowExecute: p.AllowExecute,
+			AllowOpen:    p.AllowOpen,
 			Globals:      globals,
 			Metadata:     globalMeta,
 			Environments: []environment{},
