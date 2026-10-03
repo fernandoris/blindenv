@@ -63,6 +63,10 @@ func (s *Server) handleExecute(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
+	if err := s.translateCommand(ctx, project, environment, shell, &command, args, secrets); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
 	redactor := NewRedactor(secrets, db.MinSecretLength)
 	// Retain the budget plus the longest value so a value straddling the budget
 	// boundary can still be redacted before the final trim.
@@ -134,6 +138,38 @@ func (s *Server) handleExecute(ctx context.Context, req mcp.CallToolRequest) (*m
 		Stderr:     truncate(stderrText),
 		Redactions: redactions,
 	})
+}
+
+// translateCommand replaces {{SECRET_NAME}} tags that name an effective key
+// with the target shell's native environment reference, so the value is read
+// from the injected environment rather than placed on the command line. It
+// audits and returns an error when a matching tag cannot be translated safely.
+func (s *Server) translateCommand(ctx context.Context, project, environment, shell string, command *string, args []string, secrets map[string]string) error {
+	keys := keySet(secrets)
+	auditCommand := strings.Join(append([]string{*command}, args...), " ")
+	fail := func(err error) error {
+		s.audit(ctx, project, environment, "execute_with_secrets", keysOf(secrets), auditCommand, nil, 0)
+		return err
+	}
+	if shell != "" {
+		translated, err := translateSecretTags(classifyShell(shell), *command, keys)
+		if err != nil {
+			return fail(err)
+		}
+		*command = translated
+		return nil
+	}
+	// No shell: references cannot expand, so refuse matching tags in the
+	// command or its arguments.
+	if _, err := translateSecretTags(shellUnknown, *command, keys); err != nil {
+		return fail(err)
+	}
+	for _, arg := range args {
+		if _, err := translateSecretTags(shellUnknown, arg, keys); err != nil {
+			return fail(err)
+		}
+	}
+	return nil
 }
 
 func shellCommand(ctx context.Context, shell, script string) *exec.Cmd {

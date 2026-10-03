@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"runtime"
+	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
@@ -36,9 +37,10 @@ func discoverTool() mcp.Tool {
 
 func getContextTool() mcp.Tool {
 	return mcp.NewTool("get_context",
-		mcp.WithDescription("Return the execution context: OS, architecture, shell hint, active project and environment, and available key names. Never returns values."),
+		mcp.WithDescription("Return the execution context: OS, architecture, shell hint, the resolved shell's secret reference, active project and environment, and available key names. Never returns values."),
 		mcp.WithString("project", mcp.Description("Project slug; defaults to the configured project.")),
 		mcp.WithString("environment", mcp.Description("Environment name; defaults to the configured environment.")),
+		mcp.WithString("shell", mcp.Description("Shell to report the secret reference for (bash, powershell, cmd, ...); defaults to the OS shell.")),
 	)
 }
 
@@ -142,12 +144,21 @@ func (s *Server) handleGetContext(ctx context.Context, req mcp.CallToolRequest) 
 		keys = append(keys, view)
 	}
 	s.audit(ctx, project, environment, "get_context", nil, "", nil, 0)
+	shellName := strings.TrimSpace(req.GetString("shell", ""))
+	if shellName == "" {
+		shellName = shellHint()
+	}
 	return mcp.NewToolResultJSON(map[string]any{
-		"os":            runtime.GOOS,
-		"arch":          runtime.GOARCH,
-		"shell_hint":    shellHint(),
-		"project":       project,
-		"environment":   environment,
+		"os":          runtime.GOOS,
+		"arch":        runtime.GOARCH,
+		"shell_hint":  shellHint(),
+		"project":     project,
+		"environment": environment,
+		"secret_reference": map[string]any{
+			"shell":  shellName,
+			"native": referenceTemplate(classifyShell(shellName)),
+			"tag":    "{{SECRET_NAME}}",
+		},
 		"allow_execute": proj.AllowExecute,
 		"secret_keys":   keys,
 	})

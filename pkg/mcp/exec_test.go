@@ -144,6 +144,108 @@ func TestExecuteDescendantHoldingPipeReturns(t *testing.T) {
 	}
 }
 
+func TestExecuteTranslatesTagForShell(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	if err := store.SetAllowExecute(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowExecute: %v", err)
+	}
+	res, err := srv.handleExecute(ctx, call("execute_with_secrets", map[string]any{
+		"command": "echo {{API_KEY}}",
+		"shell":   "sh",
+	}))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(t, res))
+	}
+	stdout, _ := execPayload(t, resultText(t, res))["stdout"].(string)
+	if strings.Contains(stdout, "{{API_KEY}}") {
+		t.Fatalf("tag not translated: %q", stdout)
+	}
+	if !strings.Contains(stdout, "[BLINDENV_REDACTED:API_KEY]") {
+		t.Fatalf("expected redaction marker, got %q", stdout)
+	}
+	entries, err := store.ListAudit(ctx, 1)
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(entries))
+	}
+	if !strings.Contains(entries[0].Command, "${API_KEY}") {
+		t.Fatalf("audit command = %q, want native reference", entries[0].Command)
+	}
+	if strings.Contains(entries[0].Command, "sk-abcdef123456") {
+		t.Fatalf("audit command leaked the value: %q", entries[0].Command)
+	}
+}
+
+func TestExecuteRefusesTagInSingleQuotes(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	if err := store.SetAllowExecute(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowExecute: %v", err)
+	}
+	res, err := srv.handleExecute(ctx, call("execute_with_secrets", map[string]any{
+		"command": `echo '{{API_KEY}}'`,
+		"shell":   "sh",
+	}))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected refusal, got %s", resultText(t, res))
+	}
+	if !strings.Contains(resultText(t, res), "single quotes") {
+		t.Fatalf("unexpected error: %s", resultText(t, res))
+	}
+}
+
+func TestExecuteRefusesTagWithoutShell(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	if err := store.SetAllowExecute(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowExecute: %v", err)
+	}
+	res, err := srv.handleExecute(ctx, call("execute_with_secrets", map[string]any{
+		"command": "echo",
+		"args":    []any{"{{API_KEY}}"},
+	}))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected refusal, got %s", resultText(t, res))
+	}
+	if !strings.Contains(resultText(t, res), "known shell") {
+		t.Fatalf("unexpected error: %s", resultText(t, res))
+	}
+}
+
+func TestExecuteNonMatchingTagPassesThrough(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	if err := store.SetAllowExecute(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowExecute: %v", err)
+	}
+	res, err := srv.handleExecute(ctx, call("execute_with_secrets", map[string]any{
+		"command": "echo {{NOT_A_KEY}}",
+		"shell":   "sh",
+	}))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(t, res))
+	}
+	stdout, _ := execPayload(t, resultText(t, res))["stdout"].(string)
+	if !strings.Contains(stdout, "{{NOT_A_KEY}}") {
+		t.Fatalf("non-matching tag did not pass through: %q", stdout)
+	}
+}
+
 func TestExecuteKillsDescendantAfterReturn(t *testing.T) {
 	setExecLimits(t, 10*time.Second, 100000, 300*time.Millisecond)
 	srv, store := newTestServer(t)

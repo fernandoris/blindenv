@@ -67,10 +67,12 @@ func (s *Server) Serve() error {
 
 const instructions = "BlindEnv gives you access to dev/pre-prod secrets without revealing their values. " +
 	"Start by discovering available keys with discover_secrets (names, scope and environment, never values). " +
-	"Then choose a project and environment and use proxy_http_request for HTTP calls with {{SECRET_NAME}} " +
-	"substitution, or execute_with_secrets to run commands with secrets injected; both require an explicit " +
-	"environment. Use list_secret_keys for the effective keys of the resolved context and get_context for the " +
-	"active OS, project and execution capability. Never try to print or echo a secret value."
+	"Then choose a project and environment and read the shell's secret reference from get_context. " +
+	"Use proxy_http_request for HTTP calls with {{SECRET_NAME}} substitution, or execute_with_secrets to run " +
+	"commands with secrets injected; both require an explicit environment, and in a command {{SECRET_NAME}} is " +
+	"translated to the shell's native environment reference so the value is never placed on the command line. " +
+	"Use list_secret_keys for the effective keys of the resolved context and get_context for the active OS, " +
+	"project and execution capability. Never try to print or echo a secret value."
 
 func (s *Server) resolveContext(project, environment string) (string, string, error) {
 	if project == "" {

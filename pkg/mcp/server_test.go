@@ -186,6 +186,52 @@ func TestInstructionsAdvertiseDiscovery(t *testing.T) {
 	if strings.Index(instructions, "discover_secrets") > strings.Index(instructions, "proxy_http_request") {
 		t.Fatalf("discovery not described before secret-consuming tools: %s", instructions)
 	}
+	if !strings.Contains(instructions, "secret reference") || !strings.Contains(instructions, "get_context") {
+		t.Fatalf("instructions do not describe the secret reference step: %s", instructions)
+	}
+}
+
+func TestGetContextSecretReference(t *testing.T) {
+	srv, _ := newTestServer(t)
+	ctx := context.Background()
+	cases := []struct {
+		shell string
+		want  string
+	}{
+		{"powershell", "${env:NAME}"},
+		{"cmd", "%NAME%"},
+		{"bash", "${NAME}"},
+	}
+	for _, tc := range cases {
+		res, err := srv.handleGetContext(ctx, call("get_context", map[string]any{"shell": tc.shell}))
+		if err != nil {
+			t.Fatalf("handler: %v", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
+			t.Fatalf("not JSON: %v", err)
+		}
+		ref, ok := payload["secret_reference"].(map[string]any)
+		if !ok {
+			t.Fatalf("secret_reference missing: %v", payload)
+		}
+		if ref["shell"] != tc.shell || ref["native"] != tc.want || ref["tag"] != "{{SECRET_NAME}}" {
+			t.Fatalf("secret_reference = %v, want shell=%q native=%q tag={{SECRET_NAME}}", ref, tc.shell, tc.want)
+		}
+	}
+
+	res, err := srv.handleGetContext(ctx, call("get_context", nil))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	ref, _ := payload["secret_reference"].(map[string]any)
+	if ref["shell"] != shellHint() {
+		t.Fatalf("default shell = %v, want %q", ref["shell"], shellHint())
+	}
 }
 
 func TestGetContextNoValues(t *testing.T) {

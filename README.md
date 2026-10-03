@@ -44,6 +44,7 @@ Additional defaults that reduce risk:
 - `execute_with_secrets` is **disabled per project** until you enable `allow_execute`; `get_context` reports whether it is enabled so an agent can see the precondition before calling.
 - `discover_secrets` lists every key defined for a project across all scopes (names, scope and environment) and `list_secret_keys` returns names only — both never return values.
 - `proxy_http_request` and `execute_with_secrets` require an explicit environment and refuse to run without one.
+- `{{SECRET_NAME}}` works in both: `proxy_http_request` substitutes the value in-process, while `execute_with_secrets` translates it to the shell's native environment reference (`${env:NAME}`, `%NAME%` or `${NAME}`) so the value never reaches the command line. A matching tag inside single quotes or with an unknown shell is refused rather than passed through.
 - A per-call audit log records key names, commands and redaction counts — never values.
 
 ---
@@ -52,6 +53,7 @@ Additional defaults that reduce risk:
 
 - **Encrypted local vault** — embedded SQLite, per-value AES-256-GCM, master key in the OS keyring (macOS Keychain, Windows Credential Manager, Linux Secret Service) with a passphrase fallback for headless/CI.
 - **MCP server (stdio)** with five tools: `discover_secrets`, `list_secret_keys`, `get_context`, `proxy_http_request`, `execute_with_secrets`.
+- **Portable secret tag** — the same `{{SECRET_NAME}}` tag works in HTTP calls and in shell commands; BlindEnv translates it to the shell's native reference (`${env:NAME}`, `%NAME%`, `${NAME}`) instead of embedding the value, so secrets never land in `argv` or the audit command.
 - **Redaction engine** — normalizes output encoding (including Windows PowerShell UTF-16), replaces values with `[BLINDENV_REDACTED:KEY]`, longest-first, with a minimum-length guard.
 - **Bounded, timeout-safe execution** — command output is retained up to a fixed budget (100 KB) instead of buffered in full, so a verbose or runaway child cannot exhaust memory; on timeout the whole process tree is terminated, so a background descendant cannot keep a call open (this applies to `execute_with_secrets` and `blindenv run`).
 - **Four-tier secret model** — a secret is defined in exactly one of four scopes, most specific wins: **project + environment** > **project-global** (all environments of a project) > **environment-global** (one environment shared by every project) > **global** (all projects, all environments).
@@ -210,13 +212,15 @@ Once configured, the agent can ask for key names and run commands without seeing
 ```
 discover_secrets()                                   -> keys grouped by scope and environment
 list_secret_keys()                                   -> ["API_KEY", "DB_HOST", "REGION"]
-execute_with_secrets(command="npm", args=["run","migrate"], environment="staging")
+get_context(shell="powershell")                      -> secret_reference: "${env:NAME}" (tag {{SECRET_NAME}})
+execute_with_secrets(command="echo {{API_KEY}}", shell="sh", environment="staging")
+                                                     -> runs `echo ${API_KEY}`; value read from the environment
 proxy_http_request(url="https://api.staging.example.com/me",
                    headers={"Authorization": "Bearer {{API_KEY}}"},
                    environment="staging")
 ```
 
-`discover_secrets` is context-agnostic: it shows keys that a plain listing hides when the environment is unset (for example an environment-global key for `DES`). Secret-consuming tools require an explicit environment (argument or `BLINDENV_ENV`).
+`discover_secrets` is context-agnostic: it shows keys that a plain listing hides when the environment is unset (for example an environment-global key for `DES`). Secret-consuming tools require an explicit environment (argument or `BLINDENV_ENV`). In `execute_with_secrets`, `{{SECRET_NAME}}` is rewritten to the target shell's native environment reference before the shell runs, so a `{{...}}` tag no longer breaks PowerShell parsing; a matching tag inside single quotes (where the shell would not expand the reference) or with an unknown/empty shell is refused with an actionable error.
 
 ---
 
@@ -250,7 +254,7 @@ proxy_http_request(url="https://api.staging.example.com/me",
 - **Key management.** A random 32-byte master key lives in the OS keyring. Without a keyring, a passphrase is stretched with Argon2id using a persisted salt. The crypto layer only ever sees the 32-byte key.
 - **Storage.** Each secret value is sealed with AES-256-GCM and a random nonce; project, environment and key names stay readable. Values are only plaintext in memory.
 - **Resolution.** For a `(project, environment)`, the effective value is chosen by specificity: project + environment, then project-global, then environment-global, then global. When a key is defined in project-global and environment-global at once, project-global wins so a project can always shadow a shared environment default.
-- **MCP tools.** `discover_secrets` enumerates every key defined for a project across all scopes, grouped by scope with the environment name, independently of the resolved environment and without values; `list_secret_keys` and `get_context` also never return values, and `get_context` additionally reports the project's execution capability and, for each key, the source scope that supplied its effective value. `proxy_http_request` substitutes `{{SECRET_NAME}}` tags inside BlindEnv and strips secret headers when a redirect crosses hosts. `execute_with_secrets` injects the resolved secrets into a child process, captures stdout/stderr, normalizes the encoding and redacts before returning. Both secret-consuming tools require an explicit environment. Capture retains a bounded prefix (100 KB), so a child's output volume cannot exhaust memory, and the 60 s timeout kills the whole process tree, so a background descendant cannot keep the call open.
+- **MCP tools.** `discover_secrets` enumerates every key defined for a project across all scopes, grouped by scope with the environment name, independently of the resolved environment and without values; `list_secret_keys` and `get_context` also never return values, and `get_context` additionally reports the shell's secret reference, the project's execution capability and, for each key, the source scope that supplied its effective value. `proxy_http_request` substitutes `{{SECRET_NAME}}` tags inside BlindEnv and strips secret headers when a redirect crosses hosts. `execute_with_secrets` translates each matching `{{SECRET_NAME}}` tag to the target shell's native environment reference (refusing a tag inside single quotes or an unknown shell), injects the resolved secrets into a child process, captures stdout/stderr, normalizes the encoding and redacts before returning. Both secret-consuming tools require an explicit environment. Capture retains a bounded prefix (100 KB), so a child's output volume cannot exhaust memory, and the 60 s timeout kills the whole process tree, so a background descendant cannot keep the call open.
 - **Redaction.** Values are replaced longest-first with `[BLINDENV_REDACTED:KEY]`. Values shorter than 6 characters are not redacted (and are flagged when stored). `BLINDENV_*` variables are stripped from child environments so the master key and passphrase never leak to a command.
 
 ---
