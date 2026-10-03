@@ -89,17 +89,21 @@ const (
 // translateSecretTags replaces every {{KEY}} tag that names an effective key
 // with the target shell's native environment reference, so the value is read
 // from the environment instead of being placed on the command line. A tag whose
-// name is not an effective key passes through unchanged. It returns an error
-// when a matching tag cannot be translated safely: the shell is unknown or
-// empty, or the tag is inside a single-quoted region where the shell would not
-// expand the reference.
-func translateSecretTags(kind shellKind, command string, keys map[string]struct{}) (string, error) {
-	if len(keys) == 0 || !strings.Contains(command, "{{") {
-		return command, nil
+// name is not an effective key passes through unchanged. It returns the
+// translated command, the number of matching tags rewritten, and the distinct
+// unmatched tag names (deduplicated and capped). It returns an error when a
+// matching tag cannot be translated safely: the shell is unknown or empty, or
+// the tag is inside a single-quoted region where the shell would not expand the
+// reference.
+func translateSecretTags(kind shellKind, command string, keys map[string]struct{}) (string, int, []string, error) {
+	if !strings.Contains(command, "{{") {
+		return command, 0, []string{}, nil
 	}
 	var b strings.Builder
 	b.Grow(len(command))
 	state := quoteNone
+	count := 0
+	var unmatched *unmatchedCollector
 	for i, n := 0, len(command); i < n; {
 		if next, handled := consumeShellLiteral(kind, command, i, &state, &b); handled {
 			i = next
@@ -110,21 +114,31 @@ func translateSecretTags(kind shellKind, command string, keys map[string]struct{
 				name := command[i+2 : i+2+end]
 				if _, ok := keys[name]; ok {
 					if kind == shellUnknown {
-						return "", fmt.Errorf("cannot use {{%s}} without a known shell: pass the shell argument or use the native environment reference", name)
+						return "", 0, nil, fmt.Errorf("cannot use {{%s}} without a known shell: pass the shell argument or use the native environment reference", name)
 					}
 					if state == quoteSingle {
-						return "", fmt.Errorf("cannot use {{%s}} inside single quotes: the shell would not expand the reference; use double quotes or the native environment reference", name)
+						return "", 0, nil, fmt.Errorf("cannot use {{%s}} inside single quotes: the shell would not expand the reference; use double quotes or the native environment reference", name)
 					}
 					b.WriteString(nativeReference(kind, name))
+					count++
 					i = i + 2 + end + 2
 					continue
+				}
+				if name != "" {
+					if unmatched == nil {
+						unmatched = newUnmatchedCollector(keys)
+					}
+					unmatched.add(name)
 				}
 			}
 		}
 		b.WriteByte(command[i])
 		i++
 	}
-	return b.String(), nil
+	if unmatched == nil {
+		return b.String(), count, []string{}, nil
+	}
+	return b.String(), count, unmatched.list(), nil
 }
 
 // consumeShellLiteral writes a quote character or escape sequence at index i,

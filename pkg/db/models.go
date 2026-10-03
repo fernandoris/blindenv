@@ -139,4 +139,7 @@ type AuditEntry struct {
 	Command    string
 	ExitCode   *int
 	Redactions int
+	// Substitutions is the request-side count of {{SECRET_NAME}} tags replaced
+	// before the invocation was sent (or executed).
+	Substitutions int
 }

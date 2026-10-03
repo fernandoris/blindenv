@@ -73,7 +73,7 @@ func TestTranslateSecretTags(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := translateSecretTags(tc.kind, tc.in, keys)
+			got, _, _, err := translateSecretTags(tc.kind, tc.in, keys)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got %q", got)
@@ -96,7 +96,7 @@ func TestTranslateNoTagsAllocs(t *testing.T) {
 	keys := manyKeys(100)
 	cmd := strings.Repeat("echo hello ", 100)
 	allocs := testing.AllocsPerRun(100, func() {
-		if _, err := translateSecretTags(shellPOSIX, cmd, keys); err != nil {
+		if _, _, _, err := translateSecretTags(shellPOSIX, cmd, keys); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})

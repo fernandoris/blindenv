@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -893,3 +894,109 @@ func TestProxyReturnsConfigValueUnredacted(t *testing.T) {
 }
 
 func boolPtr(v bool) *bool { return &v }
+
+func TestSubstituteCountsOccurrences(t *testing.T) {
+	secrets := map[string]string{"A": "va", "B": "vb"}
+	cases := []struct {
+		name  string
+		in    string
+		want  string
+		count int
+	}{
+		{"none", "plain text", "plain text", 0},
+		{"one", "x{{A}}y", "xvay", 1},
+		{"repeated", "{{A}}{{A}}", "vava", 2},
+		{"distinct", "{{A}}-{{B}}", "va-vb", 2},
+		{"unmatched", "{{C}}", "{{C}}", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, count := substitute(tc.in, secrets)
+			if got != tc.want || count != tc.count {
+				t.Fatalf("substitute(%q) = (%q, %d), want (%q, %d)", tc.in, got, count, tc.want, tc.count)
+			}
+		})
+	}
+}
+
+func TestUnmatchedCollectorDedupAndCap(t *testing.T) {
+	keys := keySet(map[string]string{"KNOWN": "v"})
+
+	c := newUnmatchedCollector(keys)
+	if got := c.list(); len(got) != 0 {
+		t.Fatalf("empty collector = %v, want []", got)
+	}
+	c.scan("{{KNOWN}} {{MISSING}} {{MISSING}} {{}}")
+	if got := c.list(); len(got) != 1 || got[0] != "MISSING" {
+		t.Fatalf("collector = %v, want [MISSING]", got)
+	}
+
+	capped := newUnmatchedCollector(keys)
+	var b strings.Builder
+	for i := 0; i < maxUnmatchedTags+5; i++ {
+		fmt.Fprintf(&b, "{{TAG_%d}} ", i)
+	}
+	capped.scan(b.String())
+	if got := capped.list(); len(got) != maxUnmatchedTags {
+		t.Fatalf("capped collector = %d names, want %d", len(got), maxUnmatchedTags)
+	}
+}
+
+func TestProxyReportsSubstitutionsWithoutRedaction(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, "unauthorized")
+	}))
+	defer backend.Close()
+
+	srv, _ := newTestServer(t)
+	res, err := srv.handleProxy(context.Background(), call("proxy_http_request", map[string]any{
+		"url":     backend.URL,
+		"method":  "GET",
+		"headers": map[string]any{"Authorization": "Bearer {{API_KEY}}"},
+	}))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if payload["substitutions"].(float64) != 1 {
+		t.Fatalf("substitutions = %v, want 1", payload["substitutions"])
+	}
+	if payload["redactions"].(float64) != 0 {
+		t.Fatalf("redactions = %v, want 0", payload["redactions"])
+	}
+	if u, ok := payload["unmatched_tags"].([]any); !ok || len(u) != 0 {
+		t.Fatalf("unmatched_tags = %v, want []", payload["unmatched_tags"])
+	}
+}
+
+func TestProxyReportsUnmatchedTag(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer backend.Close()
+
+	srv, _ := newTestServer(t)
+	res, err := srv.handleProxy(context.Background(), call("proxy_http_request", map[string]any{
+		"url":     backend.URL,
+		"method":  "GET",
+		"headers": map[string]any{"Authorization": "Bearer {{RANCHER_TOKEN}}"},
+	}))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if payload["substitutions"].(float64) != 0 {
+		t.Fatalf("substitutions = %v, want 0", payload["substitutions"])
+	}
+	u, ok := payload["unmatched_tags"].([]any)
+	if !ok || len(u) != 1 || u[0] != "RANCHER_TOKEN" {
+		t.Fatalf("unmatched_tags = %v, want [RANCHER_TOKEN]", payload["unmatched_tags"])
+	}
+}

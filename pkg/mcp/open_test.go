@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"runtime"
 	"strings"
@@ -142,6 +143,42 @@ func TestOpenNonMatchingTagPassesThrough(t *testing.T) {
 	}
 	if launcher.url != "https://example.test/?q={{NOT_A_KEY}}" {
 		t.Fatalf("non-matching tag was altered: %s", launcher.url)
+	}
+}
+
+func TestOpenReportsSubstitutionsAndUnmatched(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	if err := store.SetAllowOpen(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowOpen: %v", err)
+	}
+	launcher := captureLauncher(t)
+	res, err := srv.handleOpen(ctx, call("open_in_browser", map[string]any{
+		"url": "https://example.test/?token={{API_KEY}}&bad={{NOPE}}",
+	}))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(t, res))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if payload["substitutions"].(float64) != 1 {
+		t.Fatalf("substitutions = %v, want 1", payload["substitutions"])
+	}
+	u, ok := payload["unmatched_tags"].([]any)
+	if !ok || len(u) != 1 || u[0] != "NOPE" {
+		t.Fatalf("unmatched_tags = %v, want [NOPE]", payload["unmatched_tags"])
+	}
+	if !strings.Contains(launcher.url, "sk-abcdef123456") || !strings.Contains(launcher.url, "{{NOPE}}") {
+		t.Fatalf("resolved URL unexpected: %s", launcher.url)
+	}
+	// The result must not leak the resolved URL.
+	if text := resultText(t, res); strings.Contains(text, "example.test") {
+		t.Fatalf("resolved URL leaked into result: %s", text)
 	}
 }
 

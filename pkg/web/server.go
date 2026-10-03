@@ -378,9 +378,10 @@ func (s *server) handleAudit(w http.ResponseWriter, r *http.Request) {
 			"tool":        e.Tool,
 			"key_names":   e.KeyNames,
 			"key_scopes":  scopes,
-			"command":     e.Command,
-			"exit_code":   e.ExitCode,
-			"redactions":  e.Redactions,
+			"command":       e.Command,
+			"exit_code":     e.ExitCode,
+			"redactions":    e.Redactions,
+			"substitutions": e.Substitutions,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"entries": out})

@@ -293,9 +293,10 @@ func TestAuditLog(t *testing.T) {
 		Environment: "staging",
 		Tool:        "execute_with_secrets",
 		KeyNames:    []string{"API_KEY", "DB_HOST"},
-		Command:     "npm run migrate",
-		ExitCode:    &exit,
-		Redactions:  2,
+		Command:       "npm run migrate",
+		ExitCode:      &exit,
+		Redactions:    2,
+		Substitutions: 3,
 	}); err != nil {
 		t.Fatalf("AppendAudit: %v", err)
 	}
@@ -307,8 +308,8 @@ func TestAuditLog(t *testing.T) {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
 	e := entries[0]
-	if e.ExitCode == nil || *e.ExitCode != 1 || e.Redactions != 2 {
-		t.Fatalf("entry = %+v, want exit 1 and 2 redactions", e)
+	if e.ExitCode == nil || *e.ExitCode != 1 || e.Redactions != 2 || e.Substitutions != 3 {
+		t.Fatalf("entry = %+v, want exit 1, 2 redactions and 3 substitutions", e)
 	}
 	if len(e.KeyNames) != 2 || e.KeyNames[0] != "API_KEY" {
 		t.Fatalf("key names = %v", e.KeyNames)
@@ -836,5 +837,61 @@ INSERT INTO environments (project_id, name, created_at) VALUES (1, 'staging', '2
 	}
 	if len(entries) != 1 || len(entries[0].KeyScopes) != 1 || entries[0].KeyScopes[0] != ScopeGlobal {
 		t.Fatalf("audit key scopes = %+v", entries)
+	}
+}
+
+func TestMigrateAuditSubstitutions(t *testing.T) {
+	key, err := crypto.NewSalt(crypto.KeySize)
+	if err != nil {
+		t.Fatalf("key: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "vault.db")
+
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	v4 := `
+CREATE TABLE schema_version (version INTEGER NOT NULL);
+INSERT INTO schema_version (version) VALUES (4);
+CREATE TABLE audit_log (
+	id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, client TEXT NOT NULL DEFAULT '',
+	project TEXT NOT NULL DEFAULT '', environment TEXT NOT NULL DEFAULT '', tool TEXT NOT NULL,
+	key_names TEXT NOT NULL DEFAULT '', key_scopes TEXT NOT NULL DEFAULT '',
+	command TEXT NOT NULL DEFAULT '', exit_code INTEGER,
+	redactions INTEGER NOT NULL DEFAULT 0);
+INSERT INTO audit_log (ts, tool, command, redactions) VALUES ('t', 'list_secret_keys', '', 5);
+`
+	if _, err := raw.Exec(v4); err != nil {
+		t.Fatalf("seed v4: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	s, err := Open(path, key)
+	if err != nil {
+		t.Fatalf("Open migrated: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	entries, err := s.ListAudit(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Redactions != 5 || entries[0].Substitutions != 0 {
+		t.Fatalf("migrated audit = %+v, want redactions 5 and substitutions 0", entries)
+	}
+
+	if err := s.AppendAudit(ctx, AuditEntry{Timestamp: time.Now(), Tool: "proxy_http_request", Substitutions: 2}); err != nil {
+		t.Fatalf("AppendAudit: %v", err)
+	}
+	entries, err = s.ListAudit(ctx, 1)
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Substitutions != 2 {
+		t.Fatalf("audit substitutions = %+v, want 2", entries)
 	}
 }

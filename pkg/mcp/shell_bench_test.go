@@ -11,7 +11,7 @@ func BenchmarkTranslateOneTag(b *testing.B) {
 	cmd := `curl --header 'Content-Type: application/json' --data '{"token":"x"}' https://api.example.com/v1/{{API_KEY}}`
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if _, err := translateSecretTags(shellPOSIX, cmd, keys); err != nil {
+		if _, _, _, err := translateSecretTags(shellPOSIX, cmd, keys); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -24,7 +24,7 @@ func BenchmarkTranslateTagCount(b *testing.B) {
 		b.Run(fmt.Sprintf("tags=%d", n), func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				if _, err := translateSecretTags(shellPOSIX, cmd, keys); err != nil {
+				if _, _, _, err := translateSecretTags(shellPOSIX, cmd, keys); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -37,7 +37,7 @@ func BenchmarkTranslateManyKeysNoTags(b *testing.B) {
 	cmd := strings.Repeat("echo hello ", 100)
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if _, err := translateSecretTags(shellPOSIX, cmd, keys); err != nil {
+		if _, _, _, err := translateSecretTags(shellPOSIX, cmd, keys); err != nil {
 			b.Fatal(err)
 		}
 	}

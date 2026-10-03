@@ -1068,10 +1068,10 @@ func (s *Store) AppendAudit(ctx context.Context, e AuditEntry) error {
 		scopes = append(scopes, string(sc))
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO audit_log (ts, client, project, environment, tool, key_names, key_scopes, command, exit_code, redactions)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO audit_log (ts, client, project, environment, tool, key_names, key_scopes, command, exit_code, redactions, substitutions)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.Timestamp.UTC().Format(time.RFC3339Nano), e.Client, e.Project, e.Environment,
-		e.Tool, strings.Join(e.KeyNames, ","), strings.Join(scopes, ","), e.Command, e.ExitCode, e.Redactions)
+		e.Tool, strings.Join(e.KeyNames, ","), strings.Join(scopes, ","), e.Command, e.ExitCode, e.Redactions, e.Substitutions)
 	if err != nil {
 		return fmt.Errorf("db: append audit: %w", err)
 	}
@@ -1084,7 +1084,7 @@ func (s *Store) ListAudit(ctx context.Context, limit int) ([]AuditEntry, error) 
 		limit = 200
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, ts, client, project, environment, tool, key_names, key_scopes, command, exit_code, redactions
+		`SELECT id, ts, client, project, environment, tool, key_names, key_scopes, command, exit_code, redactions, substitutions
 		 FROM audit_log ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("db: list audit: %w", err)
@@ -1100,7 +1100,7 @@ func (s *Store) ListAudit(ctx context.Context, limit int) ([]AuditEntry, error) 
 			exit   sql.NullInt64
 		)
 		if err := rows.Scan(&e.ID, &ts, &e.Client, &e.Project, &e.Environment, &e.Tool,
-			&keys, &scopes, &e.Command, &exit, &e.Redactions); err != nil {
+			&keys, &scopes, &e.Command, &exit, &e.Redactions, &e.Substitutions); err != nil {
 			return nil, err
 		}
 		e.Timestamp = parseTime(ts)

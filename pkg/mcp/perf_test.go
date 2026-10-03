@@ -36,6 +36,35 @@ func BenchmarkSubstituteURL(b *testing.B) {
 	url := "https://idp.example.test/authorize?client={{CLIENT_ID}}&token={{SSO_TOKEN}}&region={{REGION}}&redirect=/home"
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_ = substitute(url, secrets)
+		_, _ = substitute(url, secrets)
+	}
+}
+
+// BenchmarkSubstituteCount measures substitution with occurrence counting.
+// Allocations should stay flat across input sizes (bounded by the number of
+// matching keys, not the input length) so counting does not grow memory with
+// the request.
+func BenchmarkSubstituteCount(b *testing.B) {
+	secrets := map[string]string{
+		"SSO_TOKEN": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abcdef",
+		"CLIENT_ID": "9f8e7d6c5b4a",
+		"REGION":    "eu-west-1",
+	}
+	for _, tc := range []struct {
+		name string
+		unit string
+	}{
+		{"matches", "https://idp.example.test/authorize?client={{CLIENT_ID}}&token={{SSO_TOKEN}}&region={{REGION}}&redirect=/home\n"},
+		{"no_matches", "https://example.test/health?probe=ok&region=eu-west-1\n"},
+	} {
+		for _, n := range []int{1, 20, 200} {
+			input := strings.Repeat(tc.unit, n)
+			b.Run(fmt.Sprintf("%s/size=%d", tc.name, n), func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					_, _ = substitute(input, secrets)
+				}
+			})
+		}
 	}
 }

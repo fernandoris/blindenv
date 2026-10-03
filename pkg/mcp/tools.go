@@ -90,7 +90,7 @@ func (s *Server) handleListSecretKeys(ctx context.Context, req mcp.CallToolReque
 	if keys == nil {
 		keys = []string{}
 	}
-	s.audit(ctx, project, environment, "list_secret_keys", keys, "", nil, 0)
+	s.audit(ctx, project, environment, "list_secret_keys", keys, "", nil, 0, 0)
 	return mcp.NewToolResultJSON(map[string]any{
 		"project":     project,
 		"environment": environment,
@@ -115,7 +115,7 @@ func (s *Server) handleDiscoverSecrets(ctx context.Context, req mcp.CallToolRequ
 	for name, keys := range scoped.ProjectEnvironments {
 		projectEnvs[name] = toDiscoverViews(keys)
 	}
-	s.audit(ctx, project, environment, "discover_secrets", nil, "", nil, 0)
+	s.audit(ctx, project, environment, "discover_secrets", nil, "", nil, 0, 0)
 	return mcp.NewToolResultJSON(map[string]any{
 		"project":     project,
 		"environment": environment,
@@ -196,7 +196,7 @@ func (s *Server) handleGetContext(ctx context.Context, req mcp.CallToolRequest) 
 		keys = append(keys, view)
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i].Key < keys[j].Key })
-	s.audit(ctx, project, environment, "get_context", nil, "", nil, 0)
+	s.audit(ctx, project, environment, "get_context", nil, "", nil, 0, 0)
 	shellName := strings.TrimSpace(req.GetString("shell", ""))
 	if shellName == "" {
 		shellName = shellHint()

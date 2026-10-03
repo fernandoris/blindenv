@@ -31,10 +31,12 @@ var (
 const truncatedSuffix = "\n... [output truncated]"
 
 type execResult struct {
-	ExitCode   int    `json:"exit_code"`
-	Stdout     string `json:"stdout"`
-	Stderr     string `json:"stderr"`
-	Redactions int    `json:"redactions"`
+	ExitCode      int      `json:"exit_code"`
+	Stdout        string   `json:"stdout"`
+	Stderr        string   `json:"stderr"`
+	Substitutions int      `json:"substitutions"`
+	UnmatchedTags []string `json:"unmatched_tags"`
+	Redactions    int      `json:"redactions"`
 }
 
 func (s *Server) handleExecute(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -54,7 +56,7 @@ func (s *Server) handleExecute(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	if !proj.AllowExecute {
-		s.audit(ctx, project, environment, "execute_with_secrets", nil, command, nil, 0)
+		s.audit(ctx, project, environment, "execute_with_secrets", nil, command, nil, 0, 0)
 		return mcp.NewToolResultError("execution with secrets is disabled for this project; enable allow_execute in the BlindEnv UI"), nil
 	}
 
@@ -64,7 +66,8 @@ func (s *Server) handleExecute(ctx context.Context, req mcp.CallToolRequest) (*m
 	}
 	secrets := valuesOf(resolved)
 
-	if err := s.translateCommand(ctx, project, environment, shell, &command, args, secrets); err != nil {
+	substitutions, unmatchedTags, err := s.translateCommand(ctx, project, environment, shell, &command, args, secrets)
+	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
@@ -94,7 +97,7 @@ func (s *Server) handleExecute(ctx context.Context, req mcp.CallToolRequest) (*m
 	auditCommand := strings.Join(append([]string{command}, args...), " ")
 
 	if err := cmd.Start(); err != nil {
-		s.audit(ctx, project, environment, "execute_with_secrets", keysOf(secrets), auditCommand, nil, 0)
+		s.audit(ctx, project, environment, "execute_with_secrets", keysOf(secrets), auditCommand, nil, 0, substitutions)
 		return mcp.NewToolResultError(fmt.Sprintf("failed to run command: %v", err)), nil
 	}
 	_ = AfterProcessStart(cmd)
@@ -104,7 +107,7 @@ func (s *Server) handleExecute(ctx context.Context, req mcp.CallToolRequest) (*m
 	_ = TerminateProcessTree(cmd)
 
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-		s.audit(ctx, project, environment, "execute_with_secrets", keysOf(secrets), auditCommand, nil, 0)
+		s.audit(ctx, project, environment, "execute_with_secrets", keysOf(secrets), auditCommand, nil, 0, substitutions)
 		return mcp.NewToolResultError(fmt.Sprintf("command timed out after %s", execTimeout)), nil
 	}
 
@@ -122,7 +125,7 @@ func (s *Server) handleExecute(ctx context.Context, req mcp.CallToolRequest) (*m
 		if errors.As(runErr, &exitErr) {
 			exitCode = exitErr.ExitCode()
 		} else {
-			s.audit(ctx, project, environment, "execute_with_secrets", keysOf(secrets), auditCommand, nil, 0)
+			s.audit(ctx, project, environment, "execute_with_secrets", keysOf(secrets), auditCommand, nil, 0, substitutions)
 			return mcp.NewToolResultError(fmt.Sprintf("failed to run command: %v", runErr)), nil
 		}
 	}
@@ -131,46 +134,59 @@ func (s *Server) handleExecute(ctx context.Context, req mcp.CallToolRequest) (*m
 	stderrText, stderrRedactions := redactor.Redact(errOut.Bytes())
 	redactions := stdoutRedactions + stderrRedactions
 
-	s.audit(ctx, project, environment, "execute_with_secrets", keysOf(secrets), auditCommand, &exitCode, redactions)
+	s.audit(ctx, project, environment, "execute_with_secrets", keysOf(secrets), auditCommand, &exitCode, redactions, substitutions)
 
 	return mcp.NewToolResultJSON(execResult{
-		ExitCode:   exitCode,
-		Stdout:     truncate(stdoutText),
-		Stderr:     truncate(stderrText),
-		Redactions: redactions,
+		ExitCode:      exitCode,
+		Stdout:        truncate(stdoutText),
+		Stderr:        truncate(stderrText),
+		Substitutions: substitutions,
+		UnmatchedTags: unmatchedTags,
+		Redactions:    redactions,
 	})
 }
 
 // translateCommand replaces {{SECRET_NAME}} tags that name an effective key
 // with the target shell's native environment reference, so the value is read
 // from the injected environment rather than placed on the command line. It
-// audits and returns an error when a matching tag cannot be translated safely.
-func (s *Server) translateCommand(ctx context.Context, project, environment, shell string, command *string, args []string, secrets map[string]string) error {
+// returns the number of translated tags and the distinct unmatched tag names,
+// and audits and returns an error when a matching tag cannot be translated
+// safely.
+func (s *Server) translateCommand(ctx context.Context, project, environment, shell string, command *string, args []string, secrets map[string]string) (int, []string, error) {
 	keys := keySet(secrets)
 	auditCommand := strings.Join(append([]string{*command}, args...), " ")
-	fail := func(err error) error {
-		s.audit(ctx, project, environment, "execute_with_secrets", keysOf(secrets), auditCommand, nil, 0)
-		return err
+	unmatched := newUnmatchedCollector(keys)
+	fail := func(err error) (int, []string, error) {
+		s.audit(ctx, project, environment, "execute_with_secrets", keysOf(secrets), auditCommand, nil, 0, 0)
+		return 0, []string{}, err
 	}
 	if shell != "" {
-		translated, err := translateSecretTags(classifyShell(shell), *command, keys)
+		translated, count, names, err := translateSecretTags(classifyShell(shell), *command, keys)
 		if err != nil {
 			return fail(err)
 		}
 		*command = translated
-		return nil
+		unmatched.addAll(names)
+		return count, unmatched.list(), nil
 	}
 	// No shell: references cannot expand, so refuse matching tags in the
 	// command or its arguments.
-	if _, err := translateSecretTags(shellUnknown, *command, keys); err != nil {
+	count := 0
+	_, c, names, err := translateSecretTags(shellUnknown, *command, keys)
+	if err != nil {
 		return fail(err)
 	}
+	count += c
+	unmatched.addAll(names)
 	for _, arg := range args {
-		if _, err := translateSecretTags(shellUnknown, arg, keys); err != nil {
+		_, c, names, err := translateSecretTags(shellUnknown, arg, keys)
+		if err != nil {
 			return fail(err)
 		}
+		count += c
+		unmatched.addAll(names)
 	}
-	return nil
+	return count, unmatched.list(), nil
 }
 
 func shellCommand(ctx context.Context, shell, script string) *exec.Cmd {

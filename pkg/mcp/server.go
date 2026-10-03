@@ -103,17 +103,18 @@ func (s *Server) resolveContextForSecrets(project, environment string) (string, 
 	return project, environment, nil
 }
 
-func (s *Server) audit(ctx context.Context, project, environment, tool string, keys []string, command string, exit *int, redactions int) {
+func (s *Server) audit(ctx context.Context, project, environment, tool string, keys []string, command string, exit *int, redactions, substitutions int) {
 	entry := db.AuditEntry{
-		Timestamp:   time.Now(),
-		Client:      s.cfg.Client,
-		Project:     project,
-		Environment: environment,
-		Tool:        tool,
-		KeyNames:    keys,
-		Command:     command,
-		ExitCode:    exit,
-		Redactions:  redactions,
+		Timestamp:     time.Now(),
+		Client:        s.cfg.Client,
+		Project:       project,
+		Environment:   environment,
+		Tool:          tool,
+		KeyNames:      keys,
+		Command:       command,
+		ExitCode:      exit,
+		Redactions:    redactions,
+		Substitutions: substitutions,
 	}
 	if len(keys) > 0 {
 		if scopes, err := s.cfg.Store.EffectiveScopes(ctx, project, environment); err == nil {

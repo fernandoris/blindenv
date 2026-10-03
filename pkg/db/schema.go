@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 const baseSchemaSQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -38,9 +38,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	tool        TEXT    NOT NULL,
 	key_names   TEXT    NOT NULL DEFAULT '',
 	key_scopes  TEXT    NOT NULL DEFAULT '',
-	command     TEXT    NOT NULL DEFAULT '',
-	exit_code   INTEGER,
-	redactions  INTEGER NOT NULL DEFAULT 0
+	command       TEXT    NOT NULL DEFAULT '',
+	exit_code     INTEGER,
+	redactions    INTEGER NOT NULL DEFAULT 0,
+	substitutions INTEGER NOT NULL DEFAULT 0
 );
 `
 
@@ -119,7 +120,28 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 
+	if err := s.migrateAuditSubstitutions(ctx); err != nil {
+		return err
+	}
+
 	return s.recordSchemaVersion(ctx)
+}
+
+// migrateAuditSubstitutions adds the schema-v5 request-side substitution count
+// to an existing audit_log. It is additive; existing rows default to zero.
+func (s *Store) migrateAuditSubstitutions(ctx context.Context) error {
+	hasSubstitutions, err := s.columnExists(ctx, "audit_log", "substitutions")
+	if err != nil {
+		return err
+	}
+	if hasSubstitutions {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`ALTER TABLE audit_log ADD COLUMN substitutions INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return fmt.Errorf("db: add audit substitutions: %w", err)
+	}
+	return nil
 }
 
 // migrateSecretsMetadata adds the schema-v3 per-definition metadata columns to

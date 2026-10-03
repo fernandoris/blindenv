@@ -246,6 +246,64 @@ func TestExecuteNonMatchingTagPassesThrough(t *testing.T) {
 	}
 }
 
+func TestExecuteReportsSubstitutionsWithoutRedaction(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	if err := store.SetAllowExecute(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowExecute: %v", err)
+	}
+	res, err := srv.handleExecute(ctx, call("execute_with_secrets", map[string]any{
+		"command": ": {{API_KEY}}",
+		"shell":   "sh",
+	}))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(t, res))
+	}
+	payload := execPayload(t, resultText(t, res))
+	if payload["substitutions"].(float64) != 1 {
+		t.Fatalf("substitutions = %v, want 1", payload["substitutions"])
+	}
+	if payload["redactions"].(float64) != 0 {
+		t.Fatalf("redactions = %v, want 0", payload["redactions"])
+	}
+	entries, err := store.ListAudit(ctx, 1)
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Substitutions != 1 {
+		t.Fatalf("audit substitutions = %+v, want 1", entries)
+	}
+}
+
+func TestExecuteReportsUnmatchedTag(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	if err := store.SetAllowExecute(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowExecute: %v", err)
+	}
+	res, err := srv.handleExecute(ctx, call("execute_with_secrets", map[string]any{
+		"command": "echo {{RANCHER_TOKEN}}",
+		"shell":   "sh",
+	}))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(t, res))
+	}
+	payload := execPayload(t, resultText(t, res))
+	if payload["substitutions"].(float64) != 0 {
+		t.Fatalf("substitutions = %v, want 0", payload["substitutions"])
+	}
+	u, ok := payload["unmatched_tags"].([]any)
+	if !ok || len(u) != 1 || u[0] != "RANCHER_TOKEN" {
+		t.Fatalf("unmatched_tags = %v, want [RANCHER_TOKEN]", payload["unmatched_tags"])
+	}
+}
+
 func TestExecuteKillsDescendantAfterReturn(t *testing.T) {
 	setExecLimits(t, 10*time.Second, 100000, 300*time.Millisecond)
 	srv, store := newTestServer(t)

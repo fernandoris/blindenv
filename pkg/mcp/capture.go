@@ -81,7 +81,8 @@ func (s *StreamRedactor) Close() error {
 	return s.flush(true)
 }
 
-// Count returns the number of substitutions performed so far.
+// Count returns the number of redactions (secret occurrences scrubbed)
+// performed so far.
 func (s *StreamRedactor) Count() int { return s.count }
 
 func (s *StreamRedactor) flush(final bool) error {

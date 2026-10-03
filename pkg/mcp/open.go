@@ -49,7 +49,9 @@ func hasDisplay(goos string, lookup func(string) string) bool {
 }
 
 type openResult struct {
-	Opened bool `json:"opened"`
+	Opened        bool     `json:"opened"`
+	Substitutions int      `json:"substitutions"`
+	UnmatchedTags []string `json:"unmatched_tags"`
 }
 
 func (s *Server) handleOpen(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -67,7 +69,7 @@ func (s *Server) handleOpen(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	if !proj.AllowOpen {
-		s.audit(ctx, project, environment, "open_in_browser", nil, urlTemplate, nil, 0)
+		s.audit(ctx, project, environment, "open_in_browser", nil, urlTemplate, nil, 0, 0)
 		return mcp.NewToolResultError("opening URLs in the browser is disabled for this project; enable allow_open in the BlindEnv UI"), nil
 	}
 
@@ -76,10 +78,12 @@ func (s *Server) handleOpen(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	secrets := valuesOf(resolved)
-	// The audit records the unsubstituted template, never the resolved URL.
-	s.audit(ctx, project, environment, "open_in_browser", keysOf(secrets), urlTemplate, nil, 0)
+	unmatched := newUnmatchedCollector(keySet(secrets))
+	resolvedURL, substitutions := substitute(urlTemplate, secrets)
+	unmatched.scan(urlTemplate)
 
-	resolvedURL := substitute(urlTemplate, secrets)
+	// The audit records the unsubstituted template, never the resolved URL.
+	s.audit(ctx, project, environment, "open_in_browser", keysOf(secrets), urlTemplate, nil, 0, substitutions)
 
 	if !hasDisplay(runtime.GOOS, os.Getenv) {
 		return mcp.NewToolResultError("no graphical display detected (DISPLAY and WAYLAND_DISPLAY are unset); open the URL from a graphical session"), nil
@@ -89,5 +93,9 @@ func (s *Server) handleOpen(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		return mcp.NewToolResultError(fmt.Sprintf("failed to launch browser: %v", err)), nil
 	}
 
-	return mcp.NewToolResultJSON(openResult{Opened: true})
+	return mcp.NewToolResultJSON(openResult{
+		Opened:        true,
+		Substitutions: substitutions,
+		UnmatchedTags: unmatched.list(),
+	})
 }
