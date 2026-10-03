@@ -28,7 +28,51 @@ var (
 	ErrDuplicate = errors.New("db: duplicate")
 	// ErrInvalidName is returned for empty or reserved names.
 	ErrInvalidName = errors.New("db: invalid name")
+	// ErrInvalidMetadata is returned for an unknown type, an over-long hint, a
+	// hint that contains the value, or a non-sensitive token/password.
+	ErrInvalidMetadata = errors.New("db: invalid metadata")
 )
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func normalizeKind(kind string) SecretKind {
+	if kind == "" {
+		return KindText
+	}
+	return SecretKind(kind)
+}
+
+// normalizeMeta validates and fills the defaults of a definition's metadata:
+// the empty type becomes text and a nil Sensitive means sensitive.
+func normalizeMeta(meta SecretMeta) (SecretMeta, error) {
+	meta.Kind = normalizeKind(string(meta.Kind))
+	switch meta.Kind {
+	case KindText, KindURL, KindHost, KindConnString, KindToken, KindPassword:
+	default:
+		return SecretMeta{}, fmt.Errorf("%w: unknown type %q", ErrInvalidMetadata, meta.Kind)
+	}
+	if len(meta.Hint) > MaxHintLength {
+		return SecretMeta{}, fmt.Errorf("%w: hint exceeds %d characters", ErrInvalidMetadata, MaxHintLength)
+	}
+	if (meta.Kind == KindToken || meta.Kind == KindPassword) && !meta.IsSensitive() {
+		return SecretMeta{}, fmt.Errorf("%w: %s values must be sensitive", ErrInvalidMetadata, meta.Kind)
+	}
+	return meta, nil
+}
+
+// validateHint rejects a hint that embeds the definition's own value, so the
+// metadata channel can never carry a secret.
+func validateHint(meta SecretMeta, value string) error {
+	if meta.Hint != "" && value != "" && strings.Contains(meta.Hint, value) {
+		return fmt.Errorf("%w: hint must not contain the value", ErrInvalidMetadata)
+	}
+	return nil
+}
 
 // Store is the encrypted secret repository backed by embedded SQLite.
 type Store struct {
@@ -357,18 +401,39 @@ func priorityOf(isProject, hasEnvironment bool) int {
 }
 
 type resolvedSecret struct {
-	key      string
-	scope    Scope
-	env      string
-	enc      []byte
-	shadowed []Scope
+	key       string
+	scope     Scope
+	env       string
+	enc       []byte
+	plain     string
+	sensitive bool
+	kind      SecretKind
+	hint      string
+	shadowed  []Scope
 }
 
 type candidate struct {
-	scope Scope
-	env   string
-	enc   []byte
-	prio  int
+	scope     Scope
+	env       string
+	enc       []byte
+	plain     string
+	sensitive bool
+	kind      SecretKind
+	hint      string
+	prio      int
+}
+
+// value decrypts the winning definition when it is sensitive, or returns the
+// stored cleartext when it is not.
+func (s *Store) value(r resolvedSecret) (string, error) {
+	if !r.sensitive {
+		return r.plain, nil
+	}
+	plain, err := crypto.Decrypt(s.key, r.enc)
+	if err != nil {
+		return "", fmt.Errorf("db: decrypt %q: %w", r.key, err)
+	}
+	return string(plain), nil
 }
 
 // effectiveSecrets resolves the winner for every key applicable to a project
@@ -379,7 +444,7 @@ func (s *Store) effectiveSecrets(ctx context.Context, pid *int64, environment st
 		pidArg = *pid
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT key, value_enc, project_id, environment FROM secrets
+		`SELECT key, value_enc, value_plain, sensitive, kind, hint, project_id, environment FROM secrets
 		 WHERE (project_id = ? OR project_id IS NULL)
 		   AND (environment = ? OR environment IS NULL)`,
 		pidArg, environment)
@@ -391,19 +456,27 @@ func (s *Store) effectiveSecrets(ctx context.Context, pid *int64, environment st
 	byKey := make(map[string][]candidate)
 	for rows.Next() {
 		var (
-			key  string
-			enc  []byte
-			proj sql.NullInt64
-			env  sql.NullString
+			key       string
+			enc       []byte
+			plain     sql.NullString
+			sensitive int
+			kind      string
+			hint      string
+			proj      sql.NullInt64
+			env       sql.NullString
 		)
-		if err := rows.Scan(&key, &enc, &proj, &env); err != nil {
+		if err := rows.Scan(&key, &enc, &plain, &sensitive, &kind, &hint, &proj, &env); err != nil {
 			return nil, err
 		}
 		byKey[key] = append(byKey[key], candidate{
-			scope: scopeOf(proj.Valid, env.Valid),
-			env:   env.String,
-			enc:   enc,
-			prio:  priorityOf(proj.Valid, env.Valid),
+			scope:     scopeOf(proj.Valid, env.Valid),
+			env:       env.String,
+			enc:       enc,
+			plain:     plain.String,
+			sensitive: sensitive != 0,
+			kind:      normalizeKind(kind),
+			hint:      hint,
+			prio:      priorityOf(proj.Valid, env.Valid),
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -429,42 +502,138 @@ func (s *Store) effectiveSecrets(ctx context.Context, pid *int64, environment st
 		for _, c := range others {
 			shadowed = append(shadowed, c.scope)
 		}
+		w := cands[winner]
 		out[key] = resolvedSecret{
-			key:      key,
-			scope:    cands[winner].scope,
-			env:      cands[winner].env,
-			enc:      cands[winner].enc,
-			shadowed: shadowed,
+			key:       key,
+			scope:     w.scope,
+			env:       w.env,
+			enc:       w.enc,
+			plain:     w.plain,
+			sensitive: w.sensitive,
+			kind:      w.kind,
+			hint:      w.hint,
+			shadowed:  shadowed,
 		}
 	}
 	return out, nil
 }
 
-// PutSecret stores a secret value. An empty project selects the shared scopes
-// and an empty environment the all-environments scope, so the four
-// combinations address the four scopes. It returns true when the value is
-// shorter than MinSecretLength and therefore cannot be reliably redacted.
+// PutSecret stores a sensitive secret value with default metadata (type text,
+// no hint). An empty project selects the shared scopes and an empty
+// environment the all-environments scope, so the four combinations address the
+// four scopes. It returns true when the value is shorter than MinSecretLength
+// and therefore cannot be reliably redacted.
 func (s *Store) PutSecret(ctx context.Context, project, environment, key, value string) (bool, error) {
+	return s.PutSecretMeta(ctx, project, environment, key, value, SecretMeta{})
+}
+
+// PutSecretMeta stores a secret value together with its metadata. A sensitive
+// definition is encrypted; a non-sensitive one is kept as cleartext in
+// value_plain. It returns true when the value is too short to be redacted.
+func (s *Store) PutSecretMeta(ctx context.Context, project, environment, key, value string, meta SecretMeta) (bool, error) {
 	if strings.TrimSpace(key) == "" {
 		return false, ErrInvalidName
+	}
+	meta, err := normalizeMeta(meta)
+	if err != nil {
+		return false, err
+	}
+	if err := validateHint(meta, value); err != nil {
+		return false, err
 	}
 	pid, env, err := s.resolveScope(ctx, project, environment)
 	if err != nil {
 		return false, err
 	}
-	enc, err := crypto.Encrypt(s.key, []byte(value))
-	if err != nil {
+	if err := s.writeSecret(ctx, pid, env, key, value, meta); err != nil {
 		return false, err
+	}
+	return len(value) < MinSecretLength, nil
+}
+
+// SetSecretMetadata updates only the metadata of an existing definition. The
+// value is re-encoded only when sensitivity flips between encrypted and
+// cleartext; a value is never required from the caller.
+func (s *Store) SetSecretMetadata(ctx context.Context, project, environment, key string, meta SecretMeta) error {
+	if strings.TrimSpace(key) == "" {
+		return ErrInvalidName
+	}
+	meta, err := normalizeMeta(meta)
+	if err != nil {
+		return err
+	}
+	pid, env, err := s.resolveScope(ctx, project, environment)
+	if err != nil {
+		return err
+	}
+	where, args := s.scopeWhere(pid, env)
+	args = append(args, key)
+	var (
+		enc       []byte
+		plain     sql.NullString
+		sensitive int
+	)
+	err = s.db.QueryRowContext(ctx,
+		`SELECT value_enc, value_plain, sensitive FROM secrets WHERE `+where+` AND key = ?`, args...).
+		Scan(&enc, &plain, &sensitive)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: %q", ErrSecretNotFound, key)
+	}
+	if err != nil {
+		return fmt.Errorf("db: get secret metadata: %w", err)
+	}
+	var value string
+	if sensitive != 0 {
+		v, derr := crypto.Decrypt(s.key, enc)
+		if derr != nil {
+			return fmt.Errorf("db: decrypt %q: %w", key, derr)
+		}
+		value = string(v)
+	} else {
+		value = plain.String
+	}
+	if err := validateHint(meta, value); err != nil {
+		return err
+	}
+	if (sensitive != 0) == meta.IsSensitive() {
+		where, wargs := s.scopeWhere(pid, env)
+		updateArgs := append([]any{string(meta.Kind), meta.Hint, boolToInt(meta.IsSensitive()), nowString()}, wargs...)
+		updateArgs = append(updateArgs, key)
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE secrets SET kind = ?, hint = ?, sensitive = ?, updated_at = ? WHERE `+where+` AND key = ?`, updateArgs...); err != nil {
+			return fmt.Errorf("db: update secret metadata: %w", err)
+		}
+		return nil
+	}
+	return s.writeSecret(ctx, pid, env, key, value, meta)
+}
+
+// writeSecret upserts a definition into exactly one scope, choosing the
+// encrypted or cleartext column from the metadata's sensitivity.
+func (s *Store) writeSecret(ctx context.Context, pid *int64, env, key, value string, meta SecretMeta) error {
+	sensitive := meta.IsSensitive()
+	var (
+		enc   = []byte{}
+		plain any
+	)
+	if sensitive {
+		e, err := crypto.Encrypt(s.key, []byte(value))
+		if err != nil {
+			return err
+		}
+		enc = e
+	} else {
+		plain = value
 	}
 	now := nowString()
 	where, wargs := s.scopeWhere(pid, env)
 
-	updateArgs := append([]any{enc, now}, wargs...)
+	updateArgs := append([]any{enc, plain, boolToInt(sensitive), string(meta.Kind), meta.Hint, now}, wargs...)
 	updateArgs = append(updateArgs, key)
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE secrets SET value_enc = ?, updated_at = ? WHERE `+where+` AND key = ?`, updateArgs...)
+		`UPDATE secrets SET value_enc = ?, value_plain = ?, sensitive = ?, kind = ?, hint = ?, updated_at = ? WHERE `+where+` AND key = ?`, updateArgs...)
 	if err != nil {
-		return false, fmt.Errorf("db: update secret: %w", err)
+		return fmt.Errorf("db: update secret: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		var pidArg, envArg any
@@ -475,25 +644,27 @@ func (s *Store) PutSecret(ctx context.Context, project, environment, key, value 
 			envArg = env
 		}
 		_, err = s.db.ExecContext(ctx,
-			`INSERT INTO secrets (project_id, environment, key, value_enc, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-			pidArg, envArg, key, enc, now, now)
+			`INSERT INTO secrets (project_id, environment, key, value_enc, value_plain, sensitive, kind, hint, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			pidArg, envArg, key, enc, plain, boolToInt(sensitive), string(meta.Kind), meta.Hint, now, now)
 		if err != nil {
 			if isUniqueViolation(err) {
 				if _, uerr := s.db.ExecContext(ctx,
-					`UPDATE secrets SET value_enc = ?, updated_at = ? WHERE `+where+` AND key = ?`, updateArgs...); uerr != nil {
-					return false, fmt.Errorf("db: update secret after conflict: %w", uerr)
+					`UPDATE secrets SET value_enc = ?, value_plain = ?, sensitive = ?, kind = ?, hint = ?, updated_at = ? WHERE `+where+` AND key = ?`, updateArgs...); uerr != nil {
+					return fmt.Errorf("db: update secret after conflict: %w", uerr)
 				}
 			} else {
-				return false, fmt.Errorf("db: insert secret: %w", err)
+				return fmt.Errorf("db: insert secret: %w", err)
 			}
 		}
 	}
-	return len(value) < MinSecretLength, nil
+	return nil
 }
 
-// Resolve returns the effective plaintext values for a project and
-// environment, applying the four-tier precedence.
-func (s *Store) Resolve(ctx context.Context, project, environment string) (map[string]string, error) {
+// ResolveDetailed returns the effective definition of every key for a project
+// and environment, including the plaintext value and its metadata. Callers
+// must honour Sensitive before exposing a value.
+func (s *Store) ResolveDetailed(ctx context.Context, project, environment string) (map[string]ResolvedSecret, error) {
 	pid, _, err := s.resolveScope(ctx, project, environment)
 	if err != nil {
 		return nil, err
@@ -502,13 +673,36 @@ func (s *Store) Resolve(ctx context.Context, project, environment string) (map[s
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]string, len(effective))
+	out := make(map[string]ResolvedSecret, len(effective))
 	for key, r := range effective {
-		plain, err := crypto.Decrypt(s.key, r.enc)
+		value, err := s.value(r)
 		if err != nil {
-			return nil, fmt.Errorf("db: decrypt %q: %w", key, err)
+			return nil, err
 		}
-		out[key] = string(plain)
+		out[key] = ResolvedSecret{
+			Key:         key,
+			Value:       value,
+			Sensitive:   r.sensitive,
+			Kind:        r.kind,
+			Hint:        r.hint,
+			Scope:       r.scope,
+			Environment: r.env,
+			Overrides:   r.shadowed,
+		}
+	}
+	return out, nil
+}
+
+// Resolve returns the effective plaintext values for a project and
+// environment, applying the four-tier precedence.
+func (s *Store) Resolve(ctx context.Context, project, environment string) (map[string]string, error) {
+	detailed, err := s.ResolveDetailed(ctx, project, environment)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(detailed))
+	for key, r := range detailed {
+		out[key] = r.Value
 	}
 	return out, nil
 }
@@ -557,7 +751,15 @@ func (s *Store) ListSecrets(ctx context.Context, project, environment string) ([
 	}
 	out := make([]SecretInfo, 0, len(effective))
 	for key, r := range effective {
-		out = append(out, SecretInfo{Key: key, Scope: r.scope, Environment: r.env, Overrides: r.shadowed})
+		out = append(out, SecretInfo{
+			Key:         key,
+			Scope:       r.scope,
+			Environment: r.env,
+			Kind:        r.kind,
+			Hint:        r.hint,
+			Sensitive:   r.sensitive,
+			Overrides:   r.shadowed,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out, nil
@@ -581,41 +783,67 @@ func (s *Store) EffectiveScopes(ctx context.Context, project, environment string
 	return out, nil
 }
 
-func (s *Store) decryptScope(ctx context.Context, pid *int64, environment string) (map[string]string, error) {
-	where, args := s.scopeWhere(pid, environment)
-	rows, err := s.db.QueryContext(ctx, `SELECT key, value_enc FROM secrets WHERE `+where, args...)
+// ScopeEntries returns the value and metadata of every definition in exactly
+// one scope: shared global when project and environment are empty, shared
+// environment-global when only project is empty, project-global when only
+// environment is empty, and the project + environment scope otherwise.
+func (s *Store) ScopeEntries(ctx context.Context, project, environment string) (map[string]SecretEntry, error) {
+	pid, env, err := s.resolveScope(ctx, project, environment)
 	if err != nil {
-		return nil, fmt.Errorf("db: query secrets: %w", err)
+		return nil, err
+	}
+	where, args := s.scopeWhere(pid, env)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT key, value_enc, value_plain, sensitive, kind, hint FROM secrets WHERE `+where, args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: query scope entries: %w", err)
 	}
 	defer rows.Close()
-	out := make(map[string]string)
+	out := make(map[string]SecretEntry)
 	for rows.Next() {
 		var (
-			key string
-			enc []byte
+			key       string
+			enc       []byte
+			plain     sql.NullString
+			sensitive int
+			kind      string
+			hint      string
 		)
-		if err := rows.Scan(&key, &enc); err != nil {
+		if err := rows.Scan(&key, &enc, &plain, &sensitive, &kind, &hint); err != nil {
 			return nil, err
 		}
-		plain, err := crypto.Decrypt(s.key, enc)
-		if err != nil {
-			return nil, fmt.Errorf("db: decrypt %q: %w", key, err)
+		entry := SecretEntry{
+			Key:       key,
+			Sensitive: sensitive != 0,
+			Kind:      normalizeKind(kind),
+			Hint:      hint,
 		}
-		out[key] = string(plain)
+		if entry.Sensitive {
+			dec, derr := crypto.Decrypt(s.key, enc)
+			if derr != nil {
+				return nil, fmt.Errorf("db: decrypt %q: %w", key, derr)
+			}
+			entry.Value = string(dec)
+		} else {
+			entry.Value = plain.String
+		}
+		out[key] = entry
 	}
 	return out, rows.Err()
 }
 
 // ScopeValues returns the plaintext values defined exclusively in the given
-// scope: shared global when project and environment are empty, shared
-// environment-global when only project is empty, project-global when only
-// environment is empty, and the project + environment scope otherwise.
+// scope. It is ScopeEntries without the metadata.
 func (s *Store) ScopeValues(ctx context.Context, project, environment string) (map[string]string, error) {
-	pid, env, err := s.resolveScope(ctx, project, environment)
+	entries, err := s.ScopeEntries(ctx, project, environment)
 	if err != nil {
 		return nil, err
 	}
-	return s.decryptScope(ctx, pid, env)
+	out := make(map[string]string, len(entries))
+	for key, e := range entries {
+		out[key] = e.Value
+	}
+	return out, nil
 }
 
 type broaderDef struct {
@@ -673,18 +901,30 @@ func (s *Store) ScopeSecrets(ctx context.Context, project, environment string) (
 		return nil, err
 	}
 	where, args := s.scopeWhere(pid, env)
-	rows, err := s.db.QueryContext(ctx, `SELECT key FROM secrets WHERE `+where+` ORDER BY key`, args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT key, sensitive, kind, hint FROM secrets WHERE `+where+` ORDER BY key`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("db: query scope secrets: %w", err)
 	}
 	defer rows.Close()
-	var keys []string
+	type scopeDef struct {
+		key       string
+		sensitive bool
+		kind      SecretKind
+		hint      string
+	}
+	var defsRows []scopeDef
 	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
+		var (
+			d         scopeDef
+			sensitive int
+			kind      string
+		)
+		if err := rows.Scan(&d.key, &sensitive, &kind, &d.hint); err != nil {
 			return nil, err
 		}
-		keys = append(keys, key)
+		d.sensitive = sensitive != 0
+		d.kind = normalizeKind(kind)
+		defsRows = append(defsRows, d)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -694,29 +934,37 @@ func (s *Store) ScopeSecrets(ctx context.Context, project, environment string) (
 	if err != nil {
 		return nil, err
 	}
-	out := make([]SecretInfo, 0, len(keys))
-	for _, key := range keys {
+	out := make([]SecretInfo, 0, len(defsRows))
+	for _, d := range defsRows {
 		var overrides []Scope
 		seen := make(map[Scope]bool)
-		for _, d := range defs {
-			if seen[d.scope] {
+		for _, b := range defs {
+			if seen[b.scope] {
 				continue
 			}
-			ok, err := s.scopeDefines(ctx, d.pid, d.env, key)
+			ok, err := s.scopeDefines(ctx, b.pid, b.env, d.key)
 			if err != nil {
 				return nil, err
 			}
 			if ok {
-				overrides = append(overrides, d.scope)
-				seen[d.scope] = true
+				overrides = append(overrides, b.scope)
+				seen[b.scope] = true
 			}
 		}
-		out = append(out, SecretInfo{Key: key, Scope: scopeOf(pid != nil, env != ""), Environment: env, Overrides: overrides})
+		out = append(out, SecretInfo{
+			Key:         d.key,
+			Scope:       scopeOf(pid != nil, env != ""),
+			Environment: env,
+			Kind:        d.kind,
+			Hint:        d.hint,
+			Sensitive:   d.sensitive,
+			Overrides:   overrides,
+		})
 	}
 	return out, nil
 }
 
-// ListScopedKeys returns the key names defined in each scope applicable to a
+// ListScopedKeys returns the key definitions in each scope applicable to a
 // project: the shared global scope, the environment-global scope for every
 // environment name that carries at least one such key, the project-global
 // scope, and the project + environment scope for each of the project's
@@ -727,15 +975,15 @@ func (s *Store) ListScopedKeys(ctx context.Context, project string) (ScopedKeys,
 		return ScopedKeys{}, err
 	}
 	out := ScopedKeys{
-		Environments:        map[string][]string{},
-		ProjectEnvironments: map[string][]string{},
+		Environments:        map[string][]SecretInfo{},
+		ProjectEnvironments: map[string][]SecretInfo{},
 	}
 
 	globals, err := s.ScopeSecrets(ctx, "", "")
 	if err != nil {
 		return ScopedKeys{}, err
 	}
-	out.Global = keyNamesOf(globals)
+	out.Global = globals
 
 	sharedEnvs, err := s.ListSharedEnvironments(ctx)
 	if err != nil {
@@ -746,8 +994,8 @@ func (s *Store) ListScopedKeys(ctx context.Context, project string) (ScopedKeys,
 		if err != nil {
 			return ScopedKeys{}, err
 		}
-		if keys := keyNamesOf(secrets); len(keys) > 0 {
-			out.Environments[name] = keys
+		if len(secrets) > 0 {
+			out.Environments[name] = secrets
 		}
 	}
 
@@ -755,7 +1003,7 @@ func (s *Store) ListScopedKeys(ctx context.Context, project string) (ScopedKeys,
 	if err != nil {
 		return ScopedKeys{}, err
 	}
-	out.Project = keyNamesOf(projectGlobals)
+	out.Project = projectGlobals
 
 	envs, err := s.ListEnvironments(ctx, project)
 	if err != nil {
@@ -766,20 +1014,11 @@ func (s *Store) ListScopedKeys(ctx context.Context, project string) (ScopedKeys,
 		if err != nil {
 			return ScopedKeys{}, err
 		}
-		if keys := keyNamesOf(secrets); len(keys) > 0 {
-			out.ProjectEnvironments[e.Name] = keys
+		if len(secrets) > 0 {
+			out.ProjectEnvironments[e.Name] = secrets
 		}
 	}
 	return out, nil
-}
-
-// keyNamesOf extracts key names from secret metadata, preserving order.
-func keyNamesOf(infos []SecretInfo) []string {
-	names := make([]string, 0, len(infos))
-	for _, info := range infos {
-		names = append(names, info.Key)
-	}
-	return names
 }
 
 // DeleteSecret removes a secret from the given scope.

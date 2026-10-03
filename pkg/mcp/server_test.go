@@ -102,18 +102,18 @@ func TestDiscoverSecrets(t *testing.T) {
 	if !ok {
 		t.Fatalf("scopes group missing: %v", payload)
 	}
-	assertJSONList(t, scopes["global"], []string{"GLOBAL_TOKEN"})
-	assertJSONList(t, scopes["project"], []string{"REGION"})
+	assertJSONKeys(t, scopes["global"], []string{"GLOBAL_TOKEN"})
+	assertJSONKeys(t, scopes["project"], []string{"REGION"})
 	envs, ok := scopes["environment"].(map[string]any)
 	if !ok {
 		t.Fatalf("environment scope missing: %v", scopes)
 	}
-	assertJSONList(t, envs["DES"], []string{"RANCHER_SCOPE"})
+	assertJSONKeys(t, envs["DES"], []string{"RANCHER_SCOPE"})
 	projEnvs, ok := scopes["project_environment"].(map[string]any)
 	if !ok {
 		t.Fatalf("project_environment scope missing: %v", scopes)
 	}
-	assertJSONList(t, projEnvs["staging"], []string{"API_KEY"})
+	assertJSONKeys(t, projEnvs["staging"], []string{"API_KEY"})
 }
 
 func TestDiscoverSecretsIndependentOfEnvironment(t *testing.T) {
@@ -140,7 +140,7 @@ func TestDiscoverSecretsIndependentOfEnvironment(t *testing.T) {
 	if !ok {
 		t.Fatalf("environment scope missing: %v", scopes)
 	}
-	assertJSONList(t, envs["DES"], []string{"RANCHER_SCOPE"})
+	assertJSONKeys(t, envs["DES"], []string{"RANCHER_SCOPE"})
 }
 
 func TestDiscoverSecretsNeverReturnsValues(t *testing.T) {
@@ -163,7 +163,8 @@ func TestDiscoverSecretsNeverReturnsValues(t *testing.T) {
 	}
 }
 
-func assertJSONList(t *testing.T, raw any, want []string) {
+// assertJSONKeys checks an ordered list of discover objects by their key name.
+func assertJSONKeys(t *testing.T, raw any, want []string) {
 	t.Helper()
 	items, ok := raw.([]any)
 	if !ok {
@@ -173,8 +174,12 @@ func assertJSONList(t *testing.T, raw any, want []string) {
 		t.Fatalf("list = %v, want %v", items, want)
 	}
 	for i, w := range want {
-		if items[i] != w {
-			t.Fatalf("list[%d] = %v, want %q", i, items[i], w)
+		obj, ok := items[i].(map[string]any)
+		if !ok {
+			t.Fatalf("list[%d] is not an object: %v", i, items[i])
+		}
+		if obj["key"] != w {
+			t.Fatalf("list[%d].key = %v, want %q", i, obj["key"], w)
 		}
 	}
 }
@@ -705,3 +710,152 @@ func TestAuditRecordsSourceScope(t *testing.T) {
 		t.Fatalf("GLOBAL_TOKEN missing from audit names %v", e.KeyNames)
 	}
 }
+
+func TestDiscoverSecretsReportsMetadata(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	_, _ = store.PutSecretMeta(ctx, "my-api", "staging", "ENDPOINT", "https://rancher.example.com/v3", db.SecretMeta{
+		Kind: db.KindURL, Hint: "base includes /v3", Sensitive: boolPtr(false),
+	})
+
+	res, err := srv.handleDiscoverSecrets(ctx, call("discover_secrets", nil))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	text := resultText(t, res)
+	if strings.Contains(text, "https://rancher.example.com/v3") {
+		t.Fatalf("config value leaked in discover: %s", text)
+	}
+	var payload struct {
+		Scopes struct {
+			ProjectEnvironments map[string][]struct {
+				Key       string `json:"key"`
+				Type      string `json:"type"`
+				Hint      string `json:"hint"`
+				Sensitive bool   `json:"sensitive"`
+			} `json:"project_environment"`
+		} `json:"scopes"`
+	}
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	var entry *struct {
+		Key       string `json:"key"`
+		Type      string `json:"type"`
+		Hint      string `json:"hint"`
+		Sensitive bool   `json:"sensitive"`
+	}
+	for i := range payload.Scopes.ProjectEnvironments["staging"] {
+		if payload.Scopes.ProjectEnvironments["staging"][i].Key == "ENDPOINT" {
+			entry = &payload.Scopes.ProjectEnvironments["staging"][i]
+		}
+	}
+	if entry == nil {
+		t.Fatalf("ENDPOINT missing: %+v", payload.Scopes.ProjectEnvironments)
+	}
+	if entry.Type != "url" || entry.Hint != "base includes /v3" || entry.Sensitive {
+		t.Fatalf("metadata = %+v", entry)
+	}
+}
+
+func TestGetContextMetadataAndConfigValue(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	_, _ = store.PutSecretMeta(ctx, "my-api", "staging", "ENDPOINT", "https://rancher.example.com/v3", db.SecretMeta{
+		Kind: db.KindURL, Hint: "base includes /v3", Sensitive: boolPtr(false),
+	})
+
+	res, err := srv.handleGetContext(ctx, call("get_context", nil))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	text := resultText(t, res)
+	if strings.Contains(text, "sk-abcdef123456") {
+		t.Fatalf("sensitive value leaked: %s", text)
+	}
+	if !strings.Contains(text, "https://rancher.example.com/v3") {
+		t.Fatalf("config value missing: %s", text)
+	}
+	var payload struct {
+		Keys []struct {
+			Key       string `json:"key"`
+			Type      string `json:"type"`
+			Hint      string `json:"hint"`
+			Sensitive bool   `json:"sensitive"`
+			Value     string `json:"value"`
+		} `json:"secret_keys"`
+	}
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	byKey := map[string]int{}
+	for i, k := range payload.Keys {
+		byKey[k.Key] = i
+	}
+	ep := payload.Keys[byKey["ENDPOINT"]]
+	if ep.Type != "url" || ep.Hint != "base includes /v3" || ep.Sensitive || ep.Value != "https://rancher.example.com/v3" {
+		t.Fatalf("ENDPOINT = %+v", ep)
+	}
+	apiKey := payload.Keys[byKey["API_KEY"]]
+	if !apiKey.Sensitive || apiKey.Value != "" {
+		t.Fatalf("API_KEY should withhold its value: %+v", apiKey)
+	}
+}
+
+func TestExecuteReturnsConfigValueUnredacted(t *testing.T) {
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	if _, err := store.PutSecretMeta(ctx, "my-api", "staging", "ENDPOINT", "https://rancher.example.com/v3", db.SecretMeta{
+		Kind: db.KindURL, Sensitive: boolPtr(false),
+	}); err != nil {
+		t.Fatalf("PutSecretMeta: %v", err)
+	}
+	if err := store.SetAllowExecute(ctx, "my-api", true); err != nil {
+		t.Fatalf("SetAllowExecute: %v", err)
+	}
+	res, err := srv.handleExecute(ctx, call("execute_with_secrets", map[string]any{
+		"command": "sh",
+		"args":    []any{"-c", "echo $ENDPOINT"},
+	}))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	text := resultText(t, res)
+	if !strings.Contains(text, "https://rancher.example.com/v3") {
+		t.Fatalf("config value redacted or missing: %s", text)
+	}
+	if strings.Contains(text, "[BLINDENV_REDACTED:ENDPOINT]") {
+		t.Fatalf("config value was redacted: %s", text)
+	}
+}
+
+func TestProxyReturnsConfigValueUnredacted(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "endpoint=https://rancher.example.com/v3 token=sk-abcdef123456")
+	}))
+	defer backend.Close()
+
+	srv, store := newTestServer(t)
+	ctx := context.Background()
+	if _, err := store.PutSecretMeta(ctx, "my-api", "staging", "ENDPOINT", "https://rancher.example.com/v3", db.SecretMeta{
+		Kind: db.KindURL, Sensitive: boolPtr(false),
+	}); err != nil {
+		t.Fatalf("PutSecretMeta: %v", err)
+	}
+	res, err := srv.handleProxy(ctx, call("proxy_http_request", map[string]any{"url": backend.URL}))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	text := resultText(t, res)
+	if !strings.Contains(text, "https://rancher.example.com/v3") {
+		t.Fatalf("config value missing: %s", text)
+	}
+	if strings.Contains(text, "sk-abcdef123456") {
+		t.Fatalf("sensitive value leaked: %s", text)
+	}
+	if !strings.Contains(text, "[BLINDENV_REDACTED:API_KEY]") {
+		t.Fatalf("sensitive value not redacted: %s", text)
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }

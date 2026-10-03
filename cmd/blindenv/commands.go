@@ -111,11 +111,19 @@ func cmdRun(vaultPath string, args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	secrets, err := store.Resolve(ctx, project, environment)
+	resolved, err := store.ResolveDetailed(ctx, project, environment)
 	if err != nil {
 		return err
 	}
-	redactor := mcp.NewRedactor(secrets, db.MinSecretLength)
+	secrets := make(map[string]string, len(resolved))
+	redactable := make(map[string]string, len(resolved))
+	for key, r := range resolved {
+		secrets[key] = r.Value
+		if r.Sensitive {
+			redactable[key] = r.Value
+		}
+	}
+	redactor := mcp.NewRedactor(redactable, db.MinSecretLength)
 
 	cmd := exec.CommandContext(ctx, rest[0], rest[1:]...)
 	mcp.ConfigureProcess(cmd)

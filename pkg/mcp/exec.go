@@ -58,16 +58,17 @@ func (s *Server) handleExecute(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcp.NewToolResultError("execution with secrets is disabled for this project; enable allow_execute in the BlindEnv UI"), nil
 	}
 
-	secrets, err := s.cfg.Store.Resolve(ctx, project, environment)
+	resolved, err := s.cfg.Store.ResolveDetailed(ctx, project, environment)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	secrets := valuesOf(resolved)
 
 	if err := s.translateCommand(ctx, project, environment, shell, &command, args, secrets); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	redactor := NewRedactor(secrets, db.MinSecretLength)
+	redactor := NewRedactor(sensitiveValuesOf(resolved), db.MinSecretLength)
 	// Retain the budget plus the longest value so a value straddling the budget
 	// boundary can still be redacted before the final trim.
 	captureLimit := maxOutputBytes + redactor.MaxValueLen()
@@ -205,6 +206,28 @@ func truncate(s string) string {
 		return s
 	}
 	return s[:maxOutputBytes] + truncatedSuffix
+}
+
+// valuesOf extracts every effective value, sensitive or not: non-sensitive
+// configuration values are still injected and substituted.
+func valuesOf(resolved map[string]db.ResolvedSecret) map[string]string {
+	out := make(map[string]string, len(resolved))
+	for key, r := range resolved {
+		out[key] = r.Value
+	}
+	return out
+}
+
+// sensitiveValuesOf selects only the sensitive values, which are the ones the
+// redactor must scrub from output.
+func sensitiveValuesOf(resolved map[string]db.ResolvedSecret) map[string]string {
+	out := make(map[string]string, len(resolved))
+	for key, r := range resolved {
+		if r.Sensitive {
+			out[key] = r.Value
+		}
+	}
+	return out
 }
 
 func keysOf(m map[string]string) []string {

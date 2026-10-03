@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -96,21 +97,53 @@ func (s *Server) handleDiscoverSecrets(ctx context.Context, req mcp.CallToolRequ
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	envScopes := make(map[string][]discoverKeyView, len(scoped.Environments))
+	for name, keys := range scoped.Environments {
+		envScopes[name] = toDiscoverViews(keys)
+	}
+	projectEnvs := make(map[string][]discoverKeyView, len(scoped.ProjectEnvironments))
+	for name, keys := range scoped.ProjectEnvironments {
+		projectEnvs[name] = toDiscoverViews(keys)
+	}
 	s.audit(ctx, project, environment, "discover_secrets", nil, "", nil, 0)
 	return mcp.NewToolResultJSON(map[string]any{
 		"project":     project,
 		"environment": environment,
 		"scopes": map[string]any{
-			"global":              scoped.Global,
-			"environment":         scoped.Environments,
-			"project":             scoped.Project,
-			"project_environment": scoped.ProjectEnvironments,
+			"global":              toDiscoverViews(scoped.Global),
+			"environment":         envScopes,
+			"project":             toDiscoverViews(scoped.Project),
+			"project_environment": projectEnvs,
 		},
 	})
 }
 
+type discoverKeyView struct {
+	Key       string `json:"key"`
+	Type      string `json:"type"`
+	Hint      string `json:"hint,omitempty"`
+	Sensitive bool   `json:"sensitive"`
+}
+
+func toDiscoverViews(in []db.SecretInfo) []discoverKeyView {
+	out := make([]discoverKeyView, 0, len(in))
+	for _, s := range in {
+		out = append(out, discoverKeyView{
+			Key:       s.Key,
+			Type:      string(s.Kind),
+			Hint:      s.Hint,
+			Sensitive: s.Sensitive,
+		})
+	}
+	return out
+}
+
 type contextKeyView struct {
 	Key         string   `json:"key"`
+	Type        string   `json:"type"`
+	Hint        string   `json:"hint,omitempty"`
+	Sensitive   bool     `json:"sensitive"`
+	Value       string   `json:"value,omitempty"`
 	Scope       string   `json:"scope"`
 	Environment string   `json:"environment,omitempty"`
 	Overrides   []string `json:"overrides,omitempty"`
@@ -125,24 +158,34 @@ func (s *Server) handleGetContext(ctx context.Context, req mcp.CallToolRequest) 
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	infos, err := s.cfg.Store.ListSecrets(ctx, project, environment)
+	resolved, err := s.cfg.Store.ResolveDetailed(ctx, project, environment)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	keys := make([]contextKeyView, 0, len(infos))
-	for _, info := range infos {
-		view := contextKeyView{Key: info.Key, Scope: string(info.Scope)}
-		if info.Scope == db.ScopeSharedEnvironment {
-			view.Environment = info.Environment
+	keys := make([]contextKeyView, 0, len(resolved))
+	for key, r := range resolved {
+		view := contextKeyView{
+			Key:       key,
+			Type:      string(r.Kind),
+			Hint:      r.Hint,
+			Sensitive: r.Sensitive,
+			Scope:     string(r.Scope),
 		}
-		if len(info.Overrides) > 0 {
-			view.Overrides = make([]string, 0, len(info.Overrides))
-			for _, scope := range info.Overrides {
+		if !r.Sensitive {
+			view.Value = r.Value
+		}
+		if r.Scope == db.ScopeSharedEnvironment {
+			view.Environment = r.Environment
+		}
+		if len(r.Overrides) > 0 {
+			view.Overrides = make([]string, 0, len(r.Overrides))
+			for _, scope := range r.Overrides {
 				view.Overrides = append(view.Overrides, string(scope))
 			}
 		}
 		keys = append(keys, view)
 	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].Key < keys[j].Key })
 	s.audit(ctx, project, environment, "get_context", nil, "", nil, 0)
 	shellName := strings.TrimSpace(req.GetString("shell", ""))
 	if shellName == "" {

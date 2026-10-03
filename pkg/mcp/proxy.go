@@ -44,10 +44,11 @@ func (s *Server) handleProxy(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	inHeaders := stringMapArg(req, "headers")
 	inBody := req.GetString("body", "")
 
-	secrets, err := s.cfg.Store.Resolve(ctx, project, environment)
+	resolved, err := s.cfg.Store.ResolveDetailed(ctx, project, environment)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	secrets := valuesOf(resolved)
 
 	resolvedHeaders := make(map[string]string, len(inHeaders))
 	secretHeader := make(map[string]bool)
@@ -101,7 +102,7 @@ func (s *Server) handleProxy(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		return mcp.NewToolResultError(fmt.Sprintf("read response: %v", err)), nil
 	}
 
-	redactor := NewRedactor(secrets, db.MinSecretLength)
+	redactor := NewRedactor(sensitiveValuesOf(resolved), db.MinSecretLength)
 	bodyText, redactions := redactor.Redact(bodyBytes)
 
 	headers := make(map[string][]string, len(resp.Header))

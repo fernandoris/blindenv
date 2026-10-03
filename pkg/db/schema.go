@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 const baseSchemaSQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -54,6 +54,10 @@ CREATE TABLE IF NOT EXISTS secrets (
 	environment TEXT,
 	key         TEXT    NOT NULL,
 	value_enc   BLOB    NOT NULL,
+	value_plain TEXT,
+	sensitive   INTEGER NOT NULL DEFAULT 1,
+	kind        TEXT    NOT NULL DEFAULT '',
+	hint        TEXT    NOT NULL DEFAULT '',
 	created_at  TEXT    NOT NULL,
 	updated_at  TEXT    NOT NULL
 );
@@ -96,6 +100,10 @@ func (s *Store) migrate(ctx context.Context) error {
 		return fmt.Errorf("db: apply secrets schema: %w", err)
 	}
 
+	if err := s.migrateSecretsMetadata(ctx); err != nil {
+		return err
+	}
+
 	hasKeyScopes, err := s.columnExists(ctx, "audit_log", "key_scopes")
 	if err != nil {
 		return err
@@ -107,6 +115,33 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 
 	return s.recordSchemaVersion(ctx)
+}
+
+// migrateSecretsMetadata adds the schema-v3 per-definition metadata columns to
+// an existing secrets table. It is additive and preserves every definition;
+// existing rows become sensitive with an empty type and hint. value_enc stays
+// NOT NULL, so a non-sensitive row stores an empty blob there and its cleartext
+// in value_plain.
+func (s *Store) migrateSecretsMetadata(ctx context.Context) error {
+	hasSensitive, err := s.columnExists(ctx, "secrets", "sensitive")
+	if err != nil {
+		return err
+	}
+	if hasSensitive {
+		return nil
+	}
+	steps := []string{
+		`ALTER TABLE secrets ADD COLUMN sensitive INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE secrets ADD COLUMN kind TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE secrets ADD COLUMN hint TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE secrets ADD COLUMN value_plain TEXT`,
+	}
+	for _, q := range steps {
+		if _, err := s.db.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("db: add secret metadata: %w", err)
+		}
+	}
+	return nil
 }
 
 // migrateSecretsV1 rebuilds the pre-shared-scopes secrets table (which keyed

@@ -21,6 +21,39 @@ const (
 	ScopeProjectEnvironment Scope = "project_environment"
 )
 
+// SecretKind classifies a secret value's format and intended use. The empty
+// string is normalized to KindText.
+type SecretKind string
+
+const (
+	// KindText is an unclassified value.
+	KindText SecretKind = "text"
+	// KindURL is a URL, often already carrying a path.
+	KindURL SecretKind = "url"
+	// KindHost is a host name or host:port.
+	KindHost SecretKind = "host"
+	// KindConnString is a connection string or DSN.
+	KindConnString SecretKind = "connection-string"
+	// KindToken is a bearer token or API key; always sensitive.
+	KindToken SecretKind = "token"
+	// KindPassword is a password; always sensitive.
+	KindPassword SecretKind = "password"
+)
+
+// MaxHintLength bounds the optional usage hint.
+const MaxHintLength = 200
+
+// SecretMeta is the optional metadata attached to a secret definition. A nil
+// Sensitive means the value is sensitive (the default).
+type SecretMeta struct {
+	Kind      SecretKind
+	Hint      string
+	Sensitive *bool
+}
+
+// IsSensitive reports the effective sensitivity, defaulting to true.
+func (m SecretMeta) IsSensitive() bool { return m.Sensitive == nil || *m.Sensitive }
+
 // Project is a named container of environments and secrets.
 type Project struct {
 	ID           int64
@@ -42,24 +75,51 @@ type SecretInfo struct {
 	Key         string
 	Scope       Scope
 	Environment string
+	Kind        SecretKind
+	Hint        string
+	Sensitive   bool
 	// Overrides lists the broader scopes this definition shadows, most
 	// specific first.
 	Overrides []Scope
 }
 
-// ScopedKeys groups the key names defined in each scope applicable to a
-// project. It never contains values.
+// ResolvedSecret is the effective definition of a key for a project and
+// environment, including the effective plaintext. Callers must honour
+// Sensitive before exposing the value to an agent or a listing.
+type ResolvedSecret struct {
+	Key         string
+	Value       string
+	Sensitive   bool
+	Kind        SecretKind
+	Hint        string
+	Scope       Scope
+	Environment string
+	Overrides   []Scope
+}
+
+// SecretEntry is a value together with the metadata defined in exactly one
+// scope. It is used for backup snapshotting.
+type SecretEntry struct {
+	Key       string
+	Value     string
+	Sensitive bool
+	Kind      SecretKind
+	Hint      string
+}
+
+// ScopedKeys groups the key definitions in each scope applicable to a project.
+// It never contains values.
 type ScopedKeys struct {
 	// Global is the shared global scope.
-	Global []string
+	Global []SecretInfo
 	// Environments maps an environment name to the keys defined in the
 	// environment-global scope for that name.
-	Environments map[string][]string
+	Environments map[string][]SecretInfo
 	// Project is the project-global scope.
-	Project []string
+	Project []SecretInfo
 	// ProjectEnvironments maps an environment name to the keys defined in the
 	// project + environment scope for that name.
-	ProjectEnvironments map[string][]string
+	ProjectEnvironments map[string][]SecretInfo
 }
 
 // AuditEntry records a single MCP tool invocation. It never contains secret

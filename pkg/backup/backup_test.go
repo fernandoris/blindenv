@@ -209,3 +209,85 @@ func TestImportV1Backup(t *testing.T) {
 		t.Fatal("allow_execute not restored from v1")
 	}
 }
+
+func TestMetadataRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	source := newStore(t)
+	seed(t, source)
+	_, _ = source.PutSecretMeta(ctx, "my-api", "staging", "ENDPOINT", "https://rancher.example.com/v3", db.SecretMeta{
+		Kind: db.KindURL, Hint: "base includes /v3", Sensitive: boolPtr(false),
+	})
+	_, _ = source.PutSecretMeta(ctx, "my-api", "staging", "TOKEN", "sk-token-123456", db.SecretMeta{
+		Kind: db.KindToken, Hint: "bearer", Sensitive: boolPtr(true),
+	})
+	_, _ = source.PutSecretMeta(ctx, "", "", "SHARED_CONFIG", "shared-value-123", db.SecretMeta{
+		Kind: db.KindHost, Hint: "shared host", Sensitive: boolPtr(false),
+	})
+
+	blob, err := Export(ctx, source, "backup-pass")
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	target := newStore(t)
+	if err := Import(ctx, target, "backup-pass", blob); err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+
+	entries, err := target.ScopeEntries(ctx, "my-api", "staging")
+	if err != nil {
+		t.Fatalf("ScopeEntries: %v", err)
+	}
+	ep := entries["ENDPOINT"]
+	if ep.Value != "https://rancher.example.com/v3" || ep.Sensitive || ep.Kind != db.KindURL || ep.Hint != "base includes /v3" {
+		t.Fatalf("ENDPOINT = %+v", ep)
+	}
+	tok := entries["TOKEN"]
+	if tok.Value != "sk-token-123456" || !tok.Sensitive || tok.Kind != db.KindToken || tok.Hint != "bearer" {
+		t.Fatalf("TOKEN = %+v", tok)
+	}
+	global, err := target.ScopeEntries(ctx, "", "")
+	if err != nil {
+		t.Fatalf("ScopeEntries global: %v", err)
+	}
+	if sc := global["SHARED_CONFIG"]; sc.Value != "shared-value-123" || sc.Sensitive || sc.Kind != db.KindHost {
+		t.Fatalf("SHARED_CONFIG = %+v", sc)
+	}
+}
+
+func TestImportV1BackupDefaultsToSensitiveText(t *testing.T) {
+	ctx := context.Background()
+	snapshot := data{Projects: []project{{
+		Slug:         "legacy-api",
+		AllowExecute: false,
+		Globals:      map[string]string{"REGION": "eu-west-1"},
+	}}}
+	plain, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	salt, err := crypto.NewSalt(saltSize)
+	if err != nil {
+		t.Fatalf("salt: %v", err)
+	}
+	ciphertext, err := crypto.Encrypt(crypto.DeriveKey([]byte("legacy-pass"), salt), plain)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	blob := append(append([]byte{}, magicV1...), salt...)
+	blob = append(blob, ciphertext...)
+
+	target := newStore(t)
+	if err := Import(ctx, target, "legacy-pass", blob); err != nil {
+		t.Fatalf("Import v1: %v", err)
+	}
+	entries, err := target.ScopeEntries(ctx, "legacy-api", "")
+	if err != nil {
+		t.Fatalf("ScopeEntries: %v", err)
+	}
+	e := entries["REGION"]
+	if e.Value != "eu-west-1" || !e.Sensitive || e.Kind != db.KindText || e.Hint != "" {
+		t.Fatalf("legacy metadata = %+v, want sensitive text", e)
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }

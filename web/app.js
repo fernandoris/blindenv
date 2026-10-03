@@ -385,14 +385,19 @@ function inheritedForEnv(env) {
   const definedKeys = new Set(env.secrets.map((s) => s.key));
   return env.effective
     .filter((e) => e.scope !== "project_environment" && !definedKeys.has(e.key))
-    .map((e) => ({ key: e.key, scope: e.scope, source: e.scope }))
+    .map((e) => ({ ...e, source: e.scope }))
     .sort((a, b) => (SCOPE_RANK[a.scope] ?? 9) - (SCOPE_RANK[b.scope] ?? 9) || a.key.localeCompare(b.key));
 }
 
 function filterSecrets(list) {
   const q = ui.filter.toLowerCase();
   if (!q) return list;
-  return list.filter((s) => s.key.toLowerCase().includes(q));
+  return list.filter(
+    (s) =>
+      s.key.toLowerCase().includes(q) ||
+      (s.type || "text").toLowerCase().includes(q) ||
+      (s.hint || "").toLowerCase().includes(q)
+  );
 }
 
 function section(title, secrets, opts) {
@@ -424,19 +429,112 @@ function section(title, secrets, opts) {
   return box;
 }
 
+const SECRET_KINDS = ["text", "url", "host", "connection-string", "token", "password"];
+
+function typeOptions(selected) {
+  return SECRET_KINDS.map((k) => `<option value="${k}" ${k === (selected || "text") ? "selected" : ""}>${k}</option>`).join("");
+}
+
+function buildMetaFields(initial) {
+  const s = initial || {};
+  const wrap = document.createElement("div");
+  wrap.className = "meta mt-2 space-y-2";
+  wrap.innerHTML = `
+    <div class="flex flex-wrap items-end gap-3">
+      <label class="text-xs text-slate-400">type<br/>
+        <select name="type" class="mt-1 rounded bg-slate-800 px-2 py-1 text-sm text-slate-100 ring-1 ring-slate-700">${typeOptions(s.type)}</select>
+      </label>
+      <fieldset class="text-xs text-slate-400">
+        <legend class="mb-1">sensitivity</legend>
+        <label class="mr-3 text-slate-300"><input type="radio" name="sens" value="secret" ${s.sensitive === false ? "" : "checked"} /> secret</label>
+        <label class="text-slate-300"><input type="radio" name="sens" value="config" ${s.sensitive === false ? "checked" : ""} /> config</label>
+      </fieldset>
+    </div>
+    <label class="block text-xs text-slate-400">hint (optional)<br/>
+      <input name="hint" maxlength="200" value="${esc(s.hint || "")}" placeholder="e.g. base URL already includes /v3" class="mt-1 w-full rounded bg-slate-800 px-2 py-1 text-sm ring-1 ring-slate-700 focus:ring-sky-500" />
+    </label>
+    <p class="warning hidden rounded bg-amber-900 px-2 py-1 text-xs text-amber-100">Config values are stored unencrypted and shown to agents without redaction.</p>
+  `;
+  wireMetaFields(wrap);
+  return wrap;
+}
+
+function wireMetaFields(wrap) {
+  const typeSel = wrap.querySelector('select[name="type"]');
+  const configRadio = wrap.querySelector('input[value="config"]');
+  const secretRadio = wrap.querySelector('input[value="secret"]');
+  const warning = wrap.querySelector(".warning");
+  const update = () => {
+    const forced = typeSel.value === "token" || typeSel.value === "password";
+    if (forced) {
+      configRadio.checked = false;
+      configRadio.disabled = true;
+    } else {
+      configRadio.disabled = false;
+    }
+    warning.classList.toggle("hidden", !configRadio.checked);
+  };
+  typeSel.addEventListener("change", update);
+  secretRadio.addEventListener("change", update);
+  configRadio.addEventListener("change", update);
+  update();
+}
+
+function readMeta(wrap) {
+  const checked = wrap.querySelector('input[name="sens"]:checked');
+  return {
+    type: wrap.querySelector('select[name="type"]').value,
+    hint: wrap.querySelector('input[name="hint"]').value,
+    sensitive: checked ? checked.value !== "config" : true,
+  };
+}
+
+function keyCellDiv(key, s, extra = "") {
+  const wrap = document.createElement("div");
+  wrap.innerHTML =
+    `<span class="font-mono">${esc(key)}</span>${extra}` +
+    ` <span class="text-xs text-slate-500">${esc(s.type || "text")}</span>` +
+    (s.sensitive === false ? ` <span class="rounded bg-amber-800 px-1 text-xs text-amber-100" title="Stored unencrypted and shown to agents">not secret</span>` : "");
+  if (s.hint) {
+    const line = document.createElement("div");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "mt-0.5 text-xs text-slate-500 underline decoration-dotted";
+    btn.setAttribute("aria-expanded", "false");
+    btn.textContent = "hint";
+    const body = document.createElement("span");
+    body.className = "ml-1 hidden text-xs text-slate-400";
+    body.textContent = s.hint;
+    btn.onclick = () => {
+      const open = btn.getAttribute("aria-expanded") === "true";
+      btn.setAttribute("aria-expanded", String(!open));
+      body.classList.toggle("hidden", open);
+    };
+    line.appendChild(btn);
+    line.appendChild(body);
+    wrap.appendChild(line);
+  }
+  return wrap;
+}
+
 function addForm(target) {
-  const form = el(`<form id="add-secret-form" class="mb-3 flex flex-wrap gap-2 rounded border border-slate-800 p-2">
-    <input name="key" placeholder="KEY" required class="rounded bg-slate-800 px-2 py-1 text-sm ring-1 ring-slate-700 focus:ring-sky-500" />
-    <input name="value" placeholder="value" required class="min-w-0 flex-1 rounded bg-slate-800 px-2 py-1 text-sm ring-1 ring-slate-700 focus:ring-sky-500" />
-    <button class="rounded bg-sky-600 px-3 py-1 text-sm hover:bg-sky-500">Save</button>
+  const form = el(`<form id="add-secret-form" class="mb-3 rounded border border-slate-800 p-2">
+    <div class="flex flex-wrap gap-2">
+      <input name="key" placeholder="KEY" required class="rounded bg-slate-800 px-2 py-1 text-sm ring-1 ring-slate-700 focus:ring-sky-500" />
+      <input name="value" placeholder="value" required class="min-w-0 flex-1 rounded bg-slate-800 px-2 py-1 text-sm ring-1 ring-slate-700 focus:ring-sky-500" />
+    </div>
+    <div class="mt-2"><button class="rounded bg-sky-600 px-3 py-1 text-sm hover:bg-sky-500">Save</button></div>
   </form>`);
+  const meta = buildMetaFields({ type: "text", sensitive: true, hint: "" });
+  form.insertBefore(meta, form.lastElementChild);
   form.onsubmit = (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
     const key = fd.get("key");
     const value = fd.get("value");
+    const m = readMeta(meta);
     action(async () => {
-      const res = await createSecret(target, key, value);
+      const res = await createSecret(target, key, value, m);
       if (res && res.short) toast(`"${key}" is under 6 characters and will not be redacted from command output.`, "warning");
     });
   };
@@ -452,17 +550,32 @@ function secretRow(s, current) {
   const shadow = overrides.length
     ? `<span class="ml-2 rounded bg-amber-800 px-1 text-xs text-amber-100" title="Shadows: ${esc(overrides.join(", "))}">overrides ${esc(overrides.join(", "))}</span>`
     : "";
+  const isConfig = s.sensitive === false;
   const tr = el(`<tr class="border-t border-slate-800 align-top">
-    <td class="py-1.5 pr-4 font-mono">${esc(s.key)}${shadow}</td>
-    <td class="py-1.5 pr-4 font-mono text-slate-300"><span class="value">${revealedNow ? esc(revealed[rid]) : "••••••"}</span></td>
+    <td class="py-1.5 pr-4"></td>
+    <td class="py-1.5 pr-4 font-mono text-slate-300"><span class="value"></span></td>
     <td class="py-1.5 text-right"></td>
   </tr>`);
+  tr.querySelector("td:nth-child(1)").appendChild(keyCellDiv(s.key, s, shadow));
+  const valueSpan = tr.querySelector(".value");
+  if (isConfig) {
+    valueSpan.textContent = s.value !== undefined ? s.value : "";
+  } else {
+    valueSpan.textContent = revealedNow ? revealed[rid] : "••••••";
+  }
   const actions = tr.querySelector("td:last-child");
   if (current && target) {
-    const revealBtn = el(`<button type="button" aria-pressed="${revealedNow}" class="rounded px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600">${revealedNow ? "hide" : "reveal"}</button>`);
-    revealBtn.onclick = () => toggleReveal(rid, target, s.key, tr, revealBtn);
-    actions.appendChild(revealBtn);
-    if (revealedNow) actions.appendChild(copyButton(revealed[rid]));
+    if (isConfig) {
+      actions.appendChild(copyButton(s.value || ""));
+    } else {
+      const revealBtn = el(`<button type="button" aria-pressed="${revealedNow}" class="rounded px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600">${revealedNow ? "hide" : "reveal"}</button>`);
+      revealBtn.onclick = () => toggleReveal(rid, target, s.key, tr, revealBtn);
+      actions.appendChild(revealBtn);
+      if (revealedNow) actions.appendChild(copyButton(revealed[rid]));
+    }
+    const edit = el(`<button type="button" class="ml-2 rounded px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600">edit</button>`);
+    edit.onclick = () => openMetaEditor(s, target);
+    actions.appendChild(edit);
     const del = el(`<button type="button" class="ml-2 rounded px-2 py-0.5 text-xs bg-rose-800 hover:bg-rose-700">delete</button>`);
     del.onclick = () => requestDelete(s, target);
     actions.appendChild(del);
@@ -472,19 +585,27 @@ function secretRow(s, current) {
       const id = scopeKey(selected);
       ui.addOpen.add(id);
       renderEditor();
-      prefillAddForm(s.key);
+      prefillAddForm(s.key, s);
     };
     actions.appendChild(override);
   }
   return tr;
 }
 
-function prefillAddForm(key) {
+function prefillAddForm(key, meta) {
   const form = document.getElementById("add-secret-form");
-  if (form) {
-    form.querySelector("[name=key]").value = key;
-    form.querySelector("[name=value]").focus();
+  if (!form) return;
+  form.querySelector("[name=key]").value = key;
+  if (meta) {
+    const wrap = form.querySelector(".meta");
+    const typeSel = wrap.querySelector('select[name="type"]');
+    if (meta.type) typeSel.value = meta.type;
+    const sens = wrap.querySelector(meta.sensitive === false ? 'input[value="config"]' : 'input[value="secret"]');
+    if (sens) sens.checked = true;
+    if (meta.hint) wrap.querySelector('input[name="hint"]').value = meta.hint;
+    typeSel.dispatchEvent(new Event("change"));
   }
+  form.querySelector("[name=value]").focus();
 }
 
 function copyButton(value) {
@@ -545,14 +666,24 @@ function inheritedTable(rows) {
     const target = revealTargetFor(s.scope);
     const rid = "inherited|" + scopeKey(selected) + "|" + s.scope + "|" + s.key;
     const revealedNow = revealed[rid] !== undefined;
+    const isConfig = s.sensitive === false;
     const tr = el(`<tr class="border-t border-slate-800 text-slate-400 align-top">
-      <td class="py-1.5 pr-4 font-mono">${esc(s.key)}</td>
-      <td class="py-1.5 pr-4 font-mono"><span class="value">${revealedNow ? esc(revealed[rid]) : "••••••"}</span></td>
+      <td class="py-1.5 pr-4"></td>
+      <td class="py-1.5 pr-4 font-mono"><span class="value"></span></td>
       <td class="py-1.5 pr-4"><span class="rounded px-1 text-xs ${SCOPE_BADGE[s.scope] || "bg-slate-700"}">${esc(SCOPE_LABEL[s.scope] || s.scope)}</span></td>
       <td class="py-1.5 text-right"></td>
     </tr>`);
+    tr.querySelector("td:nth-child(1)").appendChild(keyCellDiv(s.key, s));
+    const valueSpan = tr.querySelector(".value");
+    if (isConfig) {
+      valueSpan.textContent = s.value !== undefined ? s.value : "";
+    } else {
+      valueSpan.textContent = revealedNow ? revealed[rid] : "••••••";
+    }
     const actions = tr.querySelector("td:last-child");
-    if (target) {
+    if (target && isConfig) {
+      actions.appendChild(copyButton(s.value || ""));
+    } else if (target) {
       const btn = el(`<button type="button" aria-pressed="${revealedNow}" class="rounded px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600">${revealedNow ? "hide" : "reveal"}</button>`);
       btn.onclick = () => toggleReveal(rid, target, s.key, tr, btn);
       actions.appendChild(btn);
@@ -562,7 +693,7 @@ function inheritedTable(rows) {
       const id = scopeKey(selected);
       ui.addOpen.add(id);
       renderEditor();
-      prefillAddForm(s.key);
+      prefillAddForm(s.key, s);
     };
     actions.appendChild(override);
     tbody.appendChild(tr);
@@ -596,16 +727,29 @@ function effectiveSection(effective) {
     const target = revealTargetFor(s.scope);
     const rid = "effective|" + scopeKey(selected) + "|" + s.scope + "|" + s.key;
     const revealedNow = revealed[rid] !== undefined;
+    const isConfig = s.sensitive === false;
     const tr = el(`<tr class="border-t border-slate-800 align-top">
-      <td class="py-1.5 pr-4 font-mono">${esc(s.key)}</td>
-      <td class="py-1.5 pr-4 font-mono text-slate-300"><span class="value">${revealedNow ? esc(revealed[rid]) : "••••••"}</span></td>
+      <td class="py-1.5 pr-4"></td>
+      <td class="py-1.5 pr-4 font-mono text-slate-300"><span class="value"></span></td>
       <td class="py-1.5 pr-4"><span class="rounded px-1 text-xs ${SCOPE_BADGE[s.scope] || "bg-slate-700"}">${esc(SCOPE_LABEL[s.scope] || s.scope)}</span></td>
+      <td class="py-1.5 text-right"></td>
     </tr>`);
+    tr.querySelector("td:nth-child(1)").appendChild(keyCellDiv(s.key, s));
+    const valueSpan = tr.querySelector(".value");
+    if (isConfig) {
+      valueSpan.textContent = s.value !== undefined ? s.value : "";
+    } else {
+      valueSpan.textContent = revealedNow ? revealed[rid] : "••••••";
+    }
     if (target) {
       const td = tr.querySelector("td:last-child");
-      const btn = el(`<button type="button" aria-pressed="${revealedNow}" class="rounded px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600">reveal</button>`);
-      btn.onclick = () => toggleReveal(rid, target, s.key, tr, btn);
-      td.appendChild(btn);
+      if (isConfig) {
+        td.appendChild(copyButton(s.value || ""));
+      } else {
+        const btn = el(`<button type="button" aria-pressed="${revealedNow}" class="rounded px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600">reveal</button>`);
+        btn.onclick = () => toggleReveal(rid, target, s.key, tr, btn);
+        td.appendChild(btn);
+      }
     }
     tbody.appendChild(tr);
   });
@@ -614,17 +758,56 @@ function effectiveSection(effective) {
 
 // --- Mutations ---
 
-function createSecret(target, key, value) {
+function createSecret(target, key, value, meta) {
+  const payload = Object.assign({ environment: target.environment, key, value }, meta || {});
   if (target.project) {
     return api(`/api/projects/${enc(target.project)}/secrets`, {
       method: "POST",
-      body: JSON.stringify({ environment: target.environment, key, value }),
+      body: JSON.stringify(payload),
     });
   }
   return api("/api/shared/secrets", {
     method: "POST",
-    body: JSON.stringify({ environment: target.environment, key, value }),
+    body: JSON.stringify(payload),
   });
+}
+
+function patchSecret(target, key, meta) {
+  const payload = Object.assign({ environment: target.environment, key }, meta);
+  const path = target.project ? `/api/projects/${enc(target.project)}/secrets` : "/api/shared/secrets";
+  return api(path, { method: "PATCH", body: JSON.stringify(payload) });
+}
+
+function openMetaEditor(secret, target) {
+  const root = document.getElementById("modal-root");
+  const overlay = el(`<div class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-4">
+    <div role="dialog" aria-modal="true" aria-label="Edit metadata" class="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-5">
+      <h2 class="mb-1 text-base font-semibold">Edit ${esc(secret.key)}</h2>
+      <p class="mb-3 text-xs text-slate-400">Only the metadata changes; the value is untouched.</p>
+      <div class="meta-slot"></div>
+      <div class="mt-4 flex justify-end gap-2">
+        <button type="button" data-cancel class="rounded bg-slate-700 px-3 py-1.5 text-sm hover:bg-slate-600">Cancel</button>
+        <button type="button" data-save class="rounded bg-sky-600 px-3 py-1.5 text-sm hover:bg-sky-500">Save</button>
+      </div>
+    </div>
+  </div>`);
+  const meta = buildMetaFields({ type: secret.type, sensitive: secret.sensitive, hint: secret.hint });
+  overlay.querySelector(".meta-slot").appendChild(meta);
+  const close = () => overlay.remove();
+  overlay.querySelector("[data-cancel]").onclick = close;
+  overlay.querySelector("[data-save]").onclick = () => {
+    const m = readMeta(meta);
+    close();
+    action(() => patchSecret(target, secret.key, m));
+  };
+  overlay.onclick = (e) => {
+    if (e.target === overlay) close();
+  };
+  overlay.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") close();
+  });
+  root.innerHTML = "";
+  root.appendChild(overlay);
 }
 
 function revealSecret(target, key) {

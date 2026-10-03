@@ -554,16 +554,16 @@ func TestListScopedKeysGroups(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListScopedKeys: %v", err)
 	}
-	if len(got.Global) != 1 || got.Global[0] != "GLOBAL_KEY" {
+	if len(got.Global) != 1 || got.Global[0].Key != "GLOBAL_KEY" {
 		t.Fatalf("global = %v, want [GLOBAL_KEY]", got.Global)
 	}
-	if keys := got.Environments["staging"]; len(keys) != 1 || keys[0] != "SHARED_ENV_KEY" {
+	if keys := got.Environments["staging"]; len(keys) != 1 || keys[0].Key != "SHARED_ENV_KEY" {
 		t.Fatalf("environments = %v, want staging:[SHARED_ENV_KEY]", got.Environments)
 	}
-	if len(got.Project) != 1 || got.Project[0] != "PROJECT_KEY" {
+	if len(got.Project) != 1 || got.Project[0].Key != "PROJECT_KEY" {
 		t.Fatalf("project = %v, want [PROJECT_KEY]", got.Project)
 	}
-	if keys := got.ProjectEnvironments["staging"]; len(keys) != 1 || keys[0] != "PROJECT_ENV_KEY" {
+	if keys := got.ProjectEnvironments["staging"]; len(keys) != 1 || keys[0].Key != "PROJECT_ENV_KEY" {
 		t.Fatalf("project_environments = %v, want staging:[PROJECT_ENV_KEY]", got.ProjectEnvironments)
 	}
 }
@@ -600,10 +600,10 @@ func TestListScopedKeysSharedWithoutProjectEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListScopedKeys: %v", err)
 	}
-	if keys := got.Environments["DES"]; len(keys) != 1 || keys[0] != "RANCHER_SCOPE" {
+	if keys := got.Environments["DES"]; len(keys) != 1 || keys[0].Key != "RANCHER_SCOPE" {
 		t.Fatalf("DES shared env = %v, want [RANCHER_SCOPE]", got.Environments)
 	}
-	if len(got.Global) != 1 || got.Global[0] != "GLOBAL_KEY" {
+	if len(got.Global) != 1 || got.Global[0].Key != "GLOBAL_KEY" {
 		t.Fatalf("global = %v, want [GLOBAL_KEY]", got.Global)
 	}
 }

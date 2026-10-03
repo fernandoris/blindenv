@@ -38,19 +38,44 @@ type project struct {
 	Slug         string            `json:"slug"`
 	AllowExecute bool              `json:"allow_execute"`
 	Globals      map[string]string `json:"globals"`
+	Metadata     map[string]meta   `json:"metadata,omitempty"`
 	Environments []environment     `json:"environments"`
 }
 
 type environment struct {
-	Name    string            `json:"name"`
-	Secrets map[string]string `json:"secrets"`
+	Name     string            `json:"name"`
+	Secrets  map[string]string `json:"secrets"`
+	Metadata map[string]meta   `json:"metadata,omitempty"`
 }
 
 // shared holds the cross-project scopes: the global scope and each shared
 // environment scope.
 type shared struct {
 	Global       map[string]string `json:"global,omitempty"`
+	Metadata     map[string]meta   `json:"metadata,omitempty"`
 	Environments []environment     `json:"environments,omitempty"`
+}
+
+// meta is the backup representation of a definition's metadata. A nil
+// Sensitive means sensitive, so older backups and defaults import unchanged.
+type meta struct {
+	Sensitive *bool  `json:"sensitive,omitempty"`
+	Type      string `json:"type,omitempty"`
+	Hint      string `json:"hint,omitempty"`
+}
+
+func (m meta) secretMeta() db.SecretMeta {
+	return db.SecretMeta{Kind: db.SecretKind(m.Type), Hint: m.Hint, Sensitive: m.Sensitive}
+}
+
+// metaOf records metadata only when it differs from the sensitive/text/no-hint
+// default, so a vault without metadata produces an identical backup.
+func metaOf(e db.SecretEntry) (meta, bool) {
+	if e.Sensitive && (e.Kind == "" || e.Kind == db.KindText) && e.Hint == "" {
+		return meta{}, false
+	}
+	sensitive := e.Sensitive
+	return meta{Sensitive: &sensitive, Type: string(e.Kind), Hint: e.Hint}, true
 }
 
 // Export serializes every project, environment and secret, including the
@@ -124,7 +149,7 @@ func Import(ctx context.Context, store *db.Store, passphrase string, blob []byte
 			return err
 		}
 		for key, value := range p.Globals {
-			if _, err := store.PutSecret(ctx, p.Slug, "", key, value); err != nil {
+			if _, err := store.PutSecretMeta(ctx, p.Slug, "", key, value, p.Metadata[key].secretMeta()); err != nil {
 				return err
 			}
 		}
@@ -133,7 +158,7 @@ func Import(ctx context.Context, store *db.Store, passphrase string, blob []byte
 				return err
 			}
 			for key, value := range e.Secrets {
-				if _, err := store.PutSecret(ctx, p.Slug, e.Name, key, value); err != nil {
+				if _, err := store.PutSecretMeta(ctx, p.Slug, e.Name, key, value, e.Metadata[key].secretMeta()); err != nil {
 					return err
 				}
 			}
@@ -141,13 +166,13 @@ func Import(ctx context.Context, store *db.Store, passphrase string, blob []byte
 	}
 	if s := snapshot.Shared; s != nil {
 		for key, value := range s.Global {
-			if _, err := store.PutSecret(ctx, "", "", key, value); err != nil {
+			if _, err := store.PutSecretMeta(ctx, "", "", key, value, s.Metadata[key].secretMeta()); err != nil {
 				return err
 			}
 		}
 		for _, e := range s.Environments {
 			for key, value := range e.Secrets {
-				if _, err := store.PutSecret(ctx, "", e.Name, key, value); err != nil {
+				if _, err := store.PutSecretMeta(ctx, "", e.Name, key, value, e.Metadata[key].secretMeta()); err != nil {
 					return err
 				}
 			}
@@ -163,14 +188,16 @@ func snapshotData(ctx context.Context, store *db.Store) (*data, error) {
 	}
 	out := &data{Projects: make([]project, 0, len(projects))}
 	for _, p := range projects {
-		globals, err := store.ScopeValues(ctx, p.Slug, "")
+		globalEntries, err := store.ScopeEntries(ctx, p.Slug, "")
 		if err != nil {
 			return nil, err
 		}
+		globals, globalMeta := splitEntries(globalEntries)
 		entry := project{
 			Slug:         p.Slug,
 			AllowExecute: p.AllowExecute,
 			Globals:      globals,
+			Metadata:     globalMeta,
 			Environments: []environment{},
 		}
 		envs, err := store.ListEnvironments(ctx, p.Slug)
@@ -178,11 +205,12 @@ func snapshotData(ctx context.Context, store *db.Store) (*data, error) {
 			return nil, err
 		}
 		for _, e := range envs {
-			secrets, err := store.ScopeValues(ctx, p.Slug, e.Name)
+			entries, err := store.ScopeEntries(ctx, p.Slug, e.Name)
 			if err != nil {
 				return nil, err
 			}
-			entry.Environments = append(entry.Environments, environment{Name: e.Name, Secrets: secrets})
+			secrets, metaMap := splitEntries(entries)
+			entry.Environments = append(entry.Environments, environment{Name: e.Name, Secrets: secrets, Metadata: metaMap})
 		}
 		out.Projects = append(out.Projects, entry)
 	}
@@ -196,27 +224,46 @@ func snapshotData(ctx context.Context, store *db.Store) (*data, error) {
 }
 
 func snapshotShared(ctx context.Context, store *db.Store) (*shared, error) {
-	global, err := store.ScopeValues(ctx, "", "")
+	globalEntries, err := store.ScopeEntries(ctx, "", "")
 	if err != nil {
 		return nil, err
 	}
+	global, globalMeta := splitEntries(globalEntries)
 	names, err := store.ListSharedEnvironments(ctx)
 	if err != nil {
 		return nil, err
 	}
-	s := &shared{Global: global, Environments: []environment{}}
+	s := &shared{Global: global, Metadata: globalMeta, Environments: []environment{}}
 	for _, name := range names {
-		secrets, err := store.ScopeValues(ctx, "", name)
+		entries, err := store.ScopeEntries(ctx, "", name)
 		if err != nil {
 			return nil, err
 		}
+		secrets, metaMap := splitEntries(entries)
 		if len(secrets) == 0 {
 			continue
 		}
-		s.Environments = append(s.Environments, environment{Name: name, Secrets: secrets})
+		s.Environments = append(s.Environments, environment{Name: name, Secrets: secrets, Metadata: metaMap})
 	}
 	if len(s.Global) == 0 && len(s.Environments) == 0 {
 		return nil, nil
 	}
 	return s, nil
+}
+
+// splitEntries turns a scope's entries into the value map and the sparse
+// metadata map stored in a backup.
+func splitEntries(entries map[string]db.SecretEntry) (map[string]string, map[string]meta) {
+	values := make(map[string]string, len(entries))
+	var metas map[string]meta
+	for key, e := range entries {
+		values[key] = e.Value
+		if m, ok := metaOf(e); ok {
+			if metas == nil {
+				metas = make(map[string]meta)
+			}
+			metas[key] = m
+		}
+	}
+	return values, metas
 }

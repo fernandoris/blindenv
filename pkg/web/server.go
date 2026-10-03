@@ -180,13 +180,33 @@ type secretView struct {
 	Key         string   `json:"key"`
 	Scope       string   `json:"scope"`
 	Environment string   `json:"environment,omitempty"`
+	Type        string   `json:"type"`
+	Hint        string   `json:"hint,omitempty"`
+	Sensitive   bool     `json:"sensitive"`
+	Value       string   `json:"value,omitempty"`
 	Overrides   []string `json:"overrides,omitempty"`
 }
 
 type effectiveView struct {
+	Key       string `json:"key"`
+	Scope     string `json:"scope"`
+	Type      string `json:"type"`
+	Hint      string `json:"hint,omitempty"`
+	Sensitive bool   `json:"sensitive"`
+	Value     string `json:"value,omitempty"`
+}
+
+// secretMetaBody is the metadata-only PATCH payload for a definition.
+type secretMetaBody struct {
+	Environment string `json:"environment"`
 	Key         string `json:"key"`
-	Scope       string `json:"scope"`
-	Environment string `json:"environment,omitempty"`
+	Type        string `json:"type"`
+	Hint        string `json:"hint"`
+	Sensitive   *bool  `json:"sensitive"`
+}
+
+func (b secretMetaBody) meta() db.SecretMeta {
+	return db.SecretMeta{Kind: db.SecretKind(b.Type), Hint: b.Hint, Sensitive: b.Sensitive}
 }
 
 type envView struct {
@@ -212,25 +232,61 @@ type sharedView struct {
 	Environments []sharedEnvView `json:"environments"`
 }
 
-func toSecretViews(in []db.SecretInfo) []secretView {
+func toSecretViews(in []db.SecretInfo, values map[string]string) []secretView {
 	out := make([]secretView, 0, len(in))
 	for _, s := range in {
 		overrides := make([]string, 0, len(s.Overrides))
 		for _, sc := range s.Overrides {
 			overrides = append(overrides, string(sc))
 		}
-		out = append(out, secretView{Key: s.Key, Scope: string(s.Scope), Environment: s.Environment, Overrides: overrides})
+		view := secretView{
+			Key:         s.Key,
+			Scope:       string(s.Scope),
+			Environment: s.Environment,
+			Type:        string(s.Kind),
+			Hint:        s.Hint,
+			Sensitive:   s.Sensitive,
+			Overrides:   overrides,
+		}
+		if !s.Sensitive {
+			view.Value = values[s.Key]
+		}
+		out = append(out, view)
 	}
 	return out
 }
 
-func toEffectiveViews(m map[string]db.Scope) []effectiveView {
-	out := make([]effectiveView, 0, len(m))
-	for key, scope := range m {
-		out = append(out, effectiveView{Key: key, Scope: string(scope)})
+func toEffectiveViews(resolved map[string]db.ResolvedSecret) []effectiveView {
+	out := make([]effectiveView, 0, len(resolved))
+	for key, r := range resolved {
+		view := effectiveView{
+			Key:       key,
+			Scope:     string(r.Scope),
+			Type:      string(r.Kind),
+			Hint:      r.Hint,
+			Sensitive: r.Sensitive,
+		}
+		if !r.Sensitive {
+			view.Value = r.Value
+		}
+		out = append(out, view)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out
+}
+
+// scopeSecretViews lists the definitions of exactly one scope with metadata and
+// the values of its non-sensitive definitions.
+func (s *server) scopeSecretViews(ctx context.Context, project, environment string) ([]secretView, error) {
+	infos, err := s.store.ScopeSecrets(ctx, project, environment)
+	if err != nil {
+		return nil, err
+	}
+	values, err := s.store.ScopeValues(ctx, project, environment)
+	if err != nil {
+		return nil, err
+	}
+	return toSecretViews(infos, values), nil
 }
 
 func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
@@ -243,38 +299,38 @@ func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
 	out := make([]projectView, 0, len(projects))
 	for _, p := range projects {
 		pv := projectView{Slug: p.Slug, AllowExecute: p.AllowExecute, Globals: []secretView{}, Environments: []envView{}}
-		globals, err := s.store.ScopeSecrets(ctx, p.Slug, "")
+		globals, err := s.scopeSecretViews(ctx, p.Slug, "")
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		pv.Globals = toSecretViews(globals)
+		pv.Globals = globals
 		envs, err := s.store.ListEnvironments(ctx, p.Slug)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		for _, e := range envs {
-			secrets, err := s.store.ScopeSecrets(ctx, p.Slug, e.Name)
+			secrets, err := s.scopeSecretViews(ctx, p.Slug, e.Name)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
-			effective, err := s.store.EffectiveScopes(ctx, p.Slug, e.Name)
+			effective, err := s.store.ResolveDetailed(ctx, p.Slug, e.Name)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
 			pv.Environments = append(pv.Environments, envView{
 				Name:      e.Name,
-				Secrets:   toSecretViews(secrets),
+				Secrets:   secrets,
 				Effective: toEffectiveViews(effective),
 			})
 		}
 		out = append(out, pv)
 	}
 
-	sharedGlobal, err := s.store.ScopeSecrets(ctx, "", "")
+	sharedGlobal, err := s.scopeSecretViews(ctx, "", "")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -286,17 +342,17 @@ func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
 	}
 	sharedEnvs := make([]sharedEnvView, 0, len(names))
 	for _, name := range names {
-		secrets, err := s.store.ScopeSecrets(ctx, "", name)
+		secrets, err := s.scopeSecretViews(ctx, "", name)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		sharedEnvs = append(sharedEnvs, sharedEnvView{Name: name, Secrets: toSecretViews(secrets)})
+		sharedEnvs = append(sharedEnvs, sharedEnvView{Name: name, Secrets: secrets})
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"projects":            out,
-		"shared":              sharedView{Global: toSecretViews(sharedGlobal), Environments: sharedEnvs},
+		"shared":              sharedView{Global: sharedGlobal, Environments: sharedEnvs},
 		"shared_environments": names,
 	})
 }
@@ -401,16 +457,32 @@ func (s *server) handleProjectSub(w http.ResponseWriter, r *http.Request) {
 			Environment string `json:"environment"`
 			Key         string `json:"key"`
 			Value       string `json:"value"`
+			Type        string `json:"type"`
+			Hint        string `json:"hint"`
+			Sensitive   *bool  `json:"sensitive"`
 		}
 		if !readJSON(w, r, &body) {
 			return
 		}
-		short, err := s.store.PutSecret(ctx, slug, body.Environment, strings.TrimSpace(body.Key), body.Value)
+		short, err := s.store.PutSecretMeta(ctx, slug, body.Environment, strings.TrimSpace(body.Key), body.Value, db.SecretMeta{
+			Kind: db.SecretKind(body.Type), Hint: body.Hint, Sensitive: body.Sensitive,
+		})
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"short": short})
+
+	case len(parts) == 2 && parts[1] == "secrets" && r.Method == http.MethodPatch:
+		var body secretMetaBody
+		if !readJSON(w, r, &body) {
+			return
+		}
+		if err := s.store.SetSecretMetadata(ctx, slug, body.Environment, strings.TrimSpace(body.Key), body.meta()); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"updated": strings.TrimSpace(body.Key)})
 
 	case len(parts) == 2 && parts[1] == "secrets" && r.Method == http.MethodDelete:
 		environment := r.URL.Query().Get("environment")
@@ -453,16 +525,32 @@ func (s *server) handleShared(w http.ResponseWriter, r *http.Request) {
 			Environment string `json:"environment"`
 			Key         string `json:"key"`
 			Value       string `json:"value"`
+			Type        string `json:"type"`
+			Hint        string `json:"hint"`
+			Sensitive   *bool  `json:"sensitive"`
 		}
 		if !readJSON(w, r, &body) {
 			return
 		}
-		short, err := s.store.PutSecret(ctx, "", body.Environment, strings.TrimSpace(body.Key), body.Value)
+		short, err := s.store.PutSecretMeta(ctx, "", body.Environment, strings.TrimSpace(body.Key), body.Value, db.SecretMeta{
+			Kind: db.SecretKind(body.Type), Hint: body.Hint, Sensitive: body.Sensitive,
+		})
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"short": short})
+
+	case rest == "secrets" && r.Method == http.MethodPatch:
+		var body secretMetaBody
+		if !readJSON(w, r, &body) {
+			return
+		}
+		if err := s.store.SetSecretMetadata(ctx, "", body.Environment, strings.TrimSpace(body.Key), body.meta()); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"updated": strings.TrimSpace(body.Key)})
 
 	case rest == "secrets" && r.Method == http.MethodDelete:
 		environment := r.URL.Query().Get("environment")

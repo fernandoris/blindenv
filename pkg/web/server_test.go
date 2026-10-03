@@ -236,3 +236,73 @@ func TestStateExposesSharedAndEffective(t *testing.T) {
 		t.Fatalf("effective sources = %v", effective)
 	}
 }
+
+func TestStateExposesMetadataAndConfigValues(t *testing.T) {
+	_, store, mux := newTestWeb(t)
+	ctx := context.Background()
+	_, _ = store.CreateProject(ctx, "my-api")
+	_, _ = store.CreateEnvironment(ctx, "my-api", "staging")
+	_, _ = store.PutSecretMeta(ctx, "my-api", "staging", "ENDPOINT", "https://rancher.example.com/v3", db.SecretMeta{
+		Kind: db.KindURL, Hint: "base includes /v3", Sensitive: boolPtr(false),
+	})
+	_, _ = store.PutSecret(ctx, "my-api", "staging", "API_KEY", "sk-should-not-appear")
+
+	w := do(t, mux, http.MethodGet, "/api/state", "", testToken, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{"ENDPOINT", "url", "base includes /v3", "https://rancher.example.com/v3", `"sensitive":false`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("state missing %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "sk-should-not-appear") {
+		t.Fatalf("sensitive value leaked: %s", body)
+	}
+}
+
+func TestPatchSecretMetadataViaAPI(t *testing.T) {
+	_, store, mux := newTestWeb(t)
+	ctx := context.Background()
+	_, _ = store.CreateProject(ctx, "my-api")
+	_, _ = store.CreateEnvironment(ctx, "my-api", "staging")
+	_, _ = store.PutSecret(ctx, "my-api", "staging", "ENDPOINT", "https://rancher.example.com/v3")
+
+	body := `{"environment":"staging","key":"ENDPOINT","type":"url","hint":"base includes /v3","sensitive":false}`
+	if got := do(t, mux, http.MethodPatch, "/api/projects/my-api/secrets", body, testToken, "").Code; got != http.StatusOK {
+		t.Fatalf("patch status = %d", got)
+	}
+	infos, err := store.ScopeSecrets(ctx, "my-api", "staging")
+	if err != nil {
+		t.Fatalf("ScopeSecrets: %v", err)
+	}
+	if len(infos) != 1 || infos[0].Kind != db.KindURL || infos[0].Hint != "base includes /v3" || infos[0].Sensitive {
+		t.Fatalf("metadata not applied: %+v", infos)
+	}
+	// The value must survive a metadata-only change.
+	reveal := do(t, mux, http.MethodPost, "/api/projects/my-api/secrets/reveal", `{"environment":"staging","key":"ENDPOINT"}`, testToken, "")
+	if reveal.Code != http.StatusOK || !strings.Contains(reveal.Body.String(), "https://rancher.example.com/v3") {
+		t.Fatalf("value lost after patch: %d %s", reveal.Code, reveal.Body.String())
+	}
+}
+
+func TestPatchSharedSecretMetadataViaAPI(t *testing.T) {
+	_, store, mux := newTestWeb(t)
+	ctx := context.Background()
+	_, _ = store.PutSecret(ctx, "", "staging", "ENDPOINT", "https://shared.example.com/v3")
+
+	body := `{"environment":"staging","key":"ENDPOINT","type":"url","hint":"shared base","sensitive":false}`
+	if got := do(t, mux, http.MethodPatch, "/api/shared/secrets", body, testToken, "").Code; got != http.StatusOK {
+		t.Fatalf("patch status = %d", got)
+	}
+	infos, err := store.ScopeSecrets(ctx, "", "staging")
+	if err != nil {
+		t.Fatalf("ScopeSecrets: %v", err)
+	}
+	if len(infos) != 1 || infos[0].Hint != "shared base" || infos[0].Sensitive {
+		t.Fatalf("shared metadata not applied: %+v", infos)
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }
