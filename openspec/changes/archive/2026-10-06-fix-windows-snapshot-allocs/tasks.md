@@ -6,7 +6,7 @@
 ## 2. Cross-platform verification
 
 - [x] 2.1 Run `make check` locally and confirm it succeeds
-- [ ] 2.2 Push and confirm `pkg/db` passes on `windows-latest`; if the byte counts still scale there, apply the design's Windows-scoped fallback (keep the absolute byte ceiling) and document why in the test comment
+- [x] 2.2 Push and confirm `pkg/db` passes on `windows-latest`; if the byte counts still scale there, apply the design's Windows-scoped fallback (keep the absolute byte ceiling) and document why in the test comment
 
 ## 3. Documentation
 
