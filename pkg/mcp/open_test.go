@@ -4,10 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"runtime"
 	"strings"
 	"testing"
 )
+
+// forceDisplay overrides the graphical-display guard for the duration of a
+// test and restores the previous implementation on cleanup. Tests that exercise
+// the open path stub the launcher and force a display so they behave the same
+// on a headless runner as on a graphical session.
+func forceDisplay(t *testing.T, available bool) {
+	t.Helper()
+	prev := displayAvailable
+	displayAvailable = func() bool { return available }
+	t.Cleanup(func() { displayAvailable = prev })
+}
 
 // captureLauncher installs a browser-launcher override that records the
 // resolved URL and restores the previous override on cleanup.
@@ -78,6 +88,7 @@ func TestOpenResolvesSensitiveTagWithoutLeak(t *testing.T) {
 	if err := store.SetAllowOpen(ctx, "my-api", true); err != nil {
 		t.Fatalf("SetAllowOpen: %v", err)
 	}
+	forceDisplay(t, true)
 	launcher := captureLauncher(t)
 	res, err := srv.handleOpen(ctx, call("open_in_browser", map[string]any{
 		"url": "https://idp.test/authorize?token={{API_KEY}}&region={{REGION}}",
@@ -131,6 +142,7 @@ func TestOpenNonMatchingTagPassesThrough(t *testing.T) {
 	if err := store.SetAllowOpen(ctx, "my-api", true); err != nil {
 		t.Fatalf("SetAllowOpen: %v", err)
 	}
+	forceDisplay(t, true)
 	launcher := captureLauncher(t)
 	res, err := srv.handleOpen(ctx, call("open_in_browser", map[string]any{
 		"url": "https://example.test/?q={{NOT_A_KEY}}",
@@ -152,6 +164,7 @@ func TestOpenReportsSubstitutionsAndUnmatched(t *testing.T) {
 	if err := store.SetAllowOpen(ctx, "my-api", true); err != nil {
 		t.Fatalf("SetAllowOpen: %v", err)
 	}
+	forceDisplay(t, true)
 	launcher := captureLauncher(t)
 	res, err := srv.handleOpen(ctx, call("open_in_browser", map[string]any{
 		"url": "https://example.test/?token={{API_KEY}}&bad={{NOPE}}",
@@ -272,16 +285,12 @@ func TestOpenErrorDoesNotContainResolvedURL(t *testing.T) {
 }
 
 func TestOpenHeadlessLinuxRefused(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("headless display guard only applies on Linux")
-	}
 	srv, store := newTestServer(t)
 	ctx := context.Background()
 	if err := store.SetAllowOpen(ctx, "my-api", true); err != nil {
 		t.Fatalf("SetAllowOpen: %v", err)
 	}
-	t.Setenv("DISPLAY", "")
-	t.Setenv("WAYLAND_DISPLAY", "")
+	forceDisplay(t, false)
 	launcher := captureLauncher(t)
 	res, err := srv.handleOpen(ctx, call("open_in_browser", map[string]any{
 		"url": "https://example.test/?token={{API_KEY}}",

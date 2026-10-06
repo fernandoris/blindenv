@@ -48,6 +48,10 @@ func hasDisplay(goos string, lookup func(string) string) bool {
 	return lookup("DISPLAY") != "" || lookup("WAYLAND_DISPLAY") != ""
 }
 
+// displayAvailable reports whether the current session has a graphical display.
+// Tests replace it to exercise the open path without a display.
+var displayAvailable = func() bool { return hasDisplay(runtime.GOOS, os.Getenv) }
+
 type openResult struct {
 	Opened        bool     `json:"opened"`
 	Substitutions int      `json:"substitutions"`
@@ -85,7 +89,7 @@ func (s *Server) handleOpen(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// The audit records the unsubstituted template, never the resolved URL.
 	s.audit(ctx, project, environment, "open_in_browser", keysOf(secrets), urlTemplate, nil, 0, substitutions)
 
-	if !hasDisplay(runtime.GOOS, os.Getenv) {
+	if !displayAvailable() {
 		return mcp.NewToolResultError("no graphical display detected (DISPLAY and WAYLAND_DISPLAY are unset); open the URL from a graphical session"), nil
 	}
 	if err := browserLauncher(ctx, resolvedURL); err != nil {
