@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -271,20 +272,76 @@ func snapshotAllocs(t *testing.T, n int) float64 {
 	})
 }
 
+// snapshotAllocBytes returns the bytes allocated per snapshot of an n-row vault
+// and the on-disk size of the resulting snapshot. Bytes are read from
+// runtime.MemStats rather than testing.AllocsPerRun because object counts are a
+// driver/VFS detail that varies by platform, while the invariant that a
+// snapshot is streamed - not buffered - is about bytes.
+func snapshotAllocBytes(t *testing.T, n int) (perOp uint64, size int64) {
+	t.Helper()
+	key := make([]byte, crypto.KeySize)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault.db")
+	writeLegacyVault(t, path, n)
+	s, err := Open(path, key)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx := context.Background()
+	dest := path + ".v99.bak"
+
+	// Warm up once so lazily-created driver state is not counted, and read the
+	// snapshot size from that result.
+	_ = os.Remove(dest)
+	if _, err := s.snapshotVault(ctx, 99); err != nil {
+		t.Fatalf("snapshotVault: %v", err)
+	}
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatalf("stat snapshot: %v", err)
+	}
+
+	const runs = 5
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for i := 0; i < runs; i++ {
+		_ = os.Remove(dest)
+		if _, err := s.snapshotVault(ctx, 99); err != nil {
+			t.Fatalf("snapshotVault: %v", err)
+		}
+	}
+	runtime.ReadMemStats(&after)
+	return (after.TotalAlloc - before.TotalAlloc) / runs, info.Size()
+}
+
 // TestSnapshotAllocationsBounded proves the snapshot is produced by SQLite and
-// not by buffering the vault in Go: allocations must not scale with vault size.
+// not by buffering the vault in Go, so the bytes it allocates stay well below
+// the vault size and do not scale with it. Object count is a platform-dependent
+// driver/VFS detail, so it is only checked against a loose backstop.
 func TestSnapshotAllocationsBounded(t *testing.T) {
 	if testing.Short() {
 		t.Skip("seeds large vaults")
 	}
-	small := snapshotAllocs(t, 50)
-	large := snapshotAllocs(t, 5000)
-	t.Logf("snapshot allocs: small=%.0f large=%.0f", small, large)
-	if large > small*2+50 {
-		t.Fatalf("snapshot allocs scaled with vault size: small=%.0f large=%.0f", small, large)
+	smallBytes, _ := snapshotAllocBytes(t, 50)
+	largeBytes, largeSize := snapshotAllocBytes(t, 5000)
+	t.Logf("snapshot bytes: small=%d large=%d vault=%d", smallBytes, largeBytes, largeSize)
+
+	// A snapshot that buffered the vault in Go would allocate at least the
+	// vault's size; SQLite streams it, so the bytes stay well below that.
+	if largeBytes > uint64(largeSize)/2 {
+		t.Fatalf("snapshot allocated %d bytes for a %d-byte vault; want it streamed", largeBytes, largeSize)
 	}
-	if large > 2000 {
-		t.Fatalf("snapshot allocs = %.0f, want bounded", large)
+	if largeBytes > smallBytes*4+256*1024 {
+		t.Fatalf("snapshot bytes scaled with vault size: small=%d large=%d", smallBytes, largeBytes)
+	}
+
+	// Backstop against a row-by-row Go buffer (one object per row). The cap is
+	// loose because the driver's object count differs by platform.
+	if objects := snapshotAllocs(t, 5000); objects > 2000 {
+		t.Fatalf("snapshot objects = %.0f, want bounded", objects)
 	}
 }
 
