@@ -371,13 +371,13 @@ func (s *server) handleAudit(w http.ResponseWriter, r *http.Request) {
 			scopes = append(scopes, string(sc))
 		}
 		out = append(out, map[string]any{
-			"timestamp":   e.Timestamp,
-			"client":      e.Client,
-			"project":     e.Project,
-			"environment": e.Environment,
-			"tool":        e.Tool,
-			"key_names":   e.KeyNames,
-			"key_scopes":  scopes,
+			"timestamp":     e.Timestamp,
+			"client":        e.Client,
+			"project":       e.Project,
+			"environment":   e.Environment,
+			"tool":          e.Tool,
+			"key_names":     e.KeyNames,
+			"key_scopes":    scopes,
 			"command":       e.Command,
 			"exit_code":     e.ExitCode,
 			"redactions":    e.Redactions,

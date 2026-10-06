@@ -287,12 +287,12 @@ func TestAuditLog(t *testing.T) {
 	ctx := context.Background()
 	exit := 1
 	if err := s.AppendAudit(ctx, AuditEntry{
-		Timestamp:   time.Now(),
-		Client:      "opencode",
-		Project:     "my-api",
-		Environment: "staging",
-		Tool:        "execute_with_secrets",
-		KeyNames:    []string{"API_KEY", "DB_HOST"},
+		Timestamp:     time.Now(),
+		Client:        "opencode",
+		Project:       "my-api",
+		Environment:   "staging",
+		Tool:          "execute_with_secrets",
+		KeyNames:      []string{"API_KEY", "DB_HOST"},
 		Command:       "npm run migrate",
 		ExitCode:      &exit,
 		Redactions:    2,

@@ -17,7 +17,9 @@ Requires Go 1.24+ (no CGO).
 
 ## Before opening a pull request
 
-- Run `gofmt -w .`, `go vet ./...` and `go test ./...`.
+- Run `make check` before pushing. It mirrors CI: the `gofmt -l` formatting
+  gate, `go vet ./...`, `go build ./...` and `go test ./...` (no CGO). Use
+  `make fmt` to reformat in place.
 - Keep changes focused; one concern per pull request.
 - Add or update tests for behavior changes. Security-sensitive code (crypto,
   redaction, the web API boundary) must have tests.
