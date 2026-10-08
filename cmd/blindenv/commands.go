@@ -27,6 +27,7 @@ func cmdMCP(vaultPath string) error {
 		Project:     os.Getenv(mcp.EnvProject),
 		Environment: os.Getenv(mcp.EnvEnvironment),
 		Client:      os.Getenv(mcp.EnvClient),
+		VaultErr:    store.VerifyMasterKey(context.Background()),
 	})
 	return srv.Serve()
 }
@@ -46,6 +47,10 @@ func cmdUI(vaultPath string, args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+
+	if err := store.VerifyMasterKey(ctx); err != nil {
+		return err
+	}
 
 	addr := fmt.Sprintf("127.0.0.1:%d", *port)
 	return web.Serve(ctx, web.Options{Store: store, Addr: addr, Dev: *dev})
@@ -110,6 +115,10 @@ func cmdRun(vaultPath string, args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+
+	if err := store.VerifyMasterKey(ctx); err != nil {
+		return err
+	}
 
 	resolved, err := store.ResolveDetailed(ctx, project, environment)
 	if err != nil {

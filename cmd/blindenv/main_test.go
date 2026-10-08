@@ -14,6 +14,7 @@ import (
 
 	"github.com/fernandoris/blindenv/pkg/crypto"
 	"github.com/fernandoris/blindenv/pkg/mcp"
+	"github.com/fernandoris/blindenv/pkg/version"
 )
 
 func seedVault(t *testing.T) string {
@@ -82,6 +83,29 @@ func TestVersionAndHelp(t *testing.T) {
 	}
 	if _, err := captureStdout(t, func() error { return run([]string{"help"}) }); err != nil {
 		t.Fatalf("help: %v", err)
+	}
+}
+
+func TestVersionReportsBuildIdentity(t *testing.T) {
+	oldCommit, oldDate := version.Commit, version.Date
+	version.Commit, version.Date = "abc1234", "2026-01-02T00:00:00Z"
+	defer func() { version.Commit, version.Date = oldCommit, oldDate }()
+
+	out, errOut, err := captureStdStreams(t, func() error { return run([]string{"version"}) })
+	if err != nil {
+		t.Fatalf("version: %v", err)
+	}
+	if errOut != "" {
+		t.Fatalf("stderr = %q, want empty", errOut)
+	}
+	if !strings.Contains(out, "abc1234") {
+		t.Fatalf("version output missing the injected commit: %q", out)
+	}
+	if !strings.Contains(out, "2026-01-02T00:00:00Z") {
+		t.Fatalf("version output missing the injected date: %q", out)
+	}
+	if strings.Contains(out, "commit none") || strings.Contains(out, "built unknown") {
+		t.Fatalf("version output still shows placeholders: %q", out)
 	}
 }
 
@@ -288,5 +312,41 @@ func TestNoMigrationNoticeWhenCurrent(t *testing.T) {
 	}
 	if strings.Contains(errOut, "migrated") {
 		t.Fatalf("stderr = %q, want no notice", errOut)
+	}
+}
+
+func TestRunFailsFastOnWrongKey(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell differs on Windows")
+	}
+	vault := filepath.Join(t.TempDir(), "vault.db")
+	t.Setenv(EnvVault, vault)
+	t.Setenv("BLINDENV_PASSPHRASE", "correct-pass")
+
+	store, err := openVault(vault)
+	if err != nil {
+		t.Fatalf("openVault: %v", err)
+	}
+	ctx := context.Background()
+	if _, err := store.CreateProject(ctx, "my-api"); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	if _, err := store.CreateEnvironment(ctx, "my-api", "staging"); err != nil {
+		t.Fatalf("CreateEnvironment: %v", err)
+	}
+	if _, err := store.PutSecret(ctx, "my-api", "staging", "API_KEY", "sk-abcdef123456"); err != nil {
+		t.Fatalf("PutSecret: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	t.Setenv("BLINDENV_PASSPHRASE", "wrong-pass")
+	err = run([]string{"run", "my-api/staging", "--", "sh", "-c", "echo hi"})
+	if err == nil {
+		t.Fatal("want an error for a wrong master key")
+	}
+	if !strings.Contains(err.Error(), "master key") {
+		t.Fatalf("err = %v, want a master-key mismatch", err)
 	}
 }

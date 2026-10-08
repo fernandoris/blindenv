@@ -9,11 +9,13 @@ towards a clear, honest security model. Please read the threat model in the
 ```sh
 git clone https://github.com/fernandoris/blindenv
 cd blindenv
-go build ./...
+make build       # writes bin/blindenv, stamped with the commit
 go test ./...
 ```
 
-Requires Go 1.24+ (no CGO).
+Requires Go 1.24+ (no CGO). `make build` and `make install` (`PREFIX` defaults
+to `/usr/local`) inject the version, commit and date so `blindenv version`
+identifies the build.
 
 ## Before opening a pull request
 

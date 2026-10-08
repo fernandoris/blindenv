@@ -18,6 +18,21 @@ var ErrNoKey = errors.New("crypto: no master key available")
 // ErrIntegrity indicates that encrypted data failed authentication.
 var ErrIntegrity = errors.New("crypto: encrypted data failed integrity check")
 
+// MinSealedSize is the smallest possible length of a value produced by Encrypt:
+// a nonce plus the authentication tag with an empty plaintext. A sensitive
+// value stored with a shorter blob cannot be a valid ciphertext.
+var MinSealedSize = func() int {
+	block, err := aes.NewCipher(make([]byte, KeySize))
+	if err != nil {
+		return 0
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return 0
+	}
+	return gcm.NonceSize() + gcm.Overhead()
+}()
+
 // Encrypt seals plaintext with AES-256-GCM using a random nonce prepended to
 // the returned ciphertext.
 func Encrypt(key, plaintext []byte) ([]byte, error) {

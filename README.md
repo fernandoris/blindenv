@@ -75,10 +75,12 @@ Additional defaults that reduce risk:
 ```sh
 git clone https://github.com/fernandoris/blindenv
 cd blindenv
-go build -o blindenv ./cmd/blindenv
+make build                 # writes bin/blindenv, stamped with the commit
+make install               # optional: install to $(PREFIX)/bin (default /usr/local)
 ```
 
-Requires Go 1.24+.
+Requires Go 1.24+. `make build` stamps the version, commit and date into the
+binary so `blindenv version` identifies the exact build.
 
 ### With `go install`
 
@@ -98,7 +100,7 @@ Update with the same method you installed with:
 
 ```sh
 # from a source checkout
-cd blindenv && git pull && go build -o blindenv ./cmd/blindenv
+cd blindenv && git pull && make build && make install
 
 # or, if the binary lives on your PATH via go install
 go install github.com/fernandoris/blindenv/cmd/blindenv@latest
@@ -108,6 +110,37 @@ Then replace the binary on your `PATH` with the freshly built one. The dashboard
 stylesheet is committed and embedded in the binary, so no extra build step is
 needed. Configured agents do not need to change: each client launches
 `blindenv mcp` on demand and picks up the new binary automatically.
+
+`go install` writes to the Go bin directory, which may not be the one your
+`PATH` resolves; if `which blindenv` points somewhere else, copy the new binary
+over it (or install with `make install PREFIX=<dir>`).
+
+If a secret tool fails to read a value, BlindEnv names the cause instead of a
+bare integrity error:
+
+- **No sensitive value could be read with the current master key.** The vault
+  was unlocked with a different key: the passphrase or OS-keyring entry differs
+  from the one that wrote it, or the vault belongs to another installation or
+  version. Check the passphrase the MCP client passes and `blindenv version`.
+- **A specific definition is inconsistent.** One definition is marked sensitive
+  but does not hold a valid ciphertext — for example a value written as
+  configuration by an older build. The error names the key; re-save it.
+- **A per-key integrity error.** A single value failed authentication; its
+  ciphertext is corrupt or was tampered with.
+
+A master key that does not match the vault is detected when the vault is
+unlocked: `blindenv run` and the dashboard fail immediately, while the MCP
+server stays up so `discover_secrets` and `list_secret_keys` keep returning
+names and metadata — only the tools that read values report the mismatch.
+
+A stale binary is a common cause: one built before non-sensitive configuration
+values existed decrypts *every* stored value. Confirm which binary is running
+and update it:
+
+```sh
+blindenv version                       # a real commit, not "commit none"
+go version -m "$(command -v blindenv)" # the module/VCS revision it was built from
+```
 
 Vault migrations run automatically the first time a newer version opens the
 vault. They are forward-only and safe to run unattended:
@@ -284,6 +317,14 @@ open_in_browser(url="https://idp.example.test/authorize?token={{SSO_TOKEN}}",
 ---
 
 ## Development
+
+```sh
+make build                   # build bin/blindenv stamped with the current commit
+make install PREFIX=/usr/local
+make check                   # gofmt, go vet, build and the full test suite
+```
+
+Or run the steps directly:
 
 ```sh
 go test ./...                # unit tests (crypto, db, mcp, web, backup)

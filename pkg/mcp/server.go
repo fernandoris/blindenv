@@ -29,6 +29,10 @@ type Config struct {
 	Environment string
 	Client      string
 	Logger      *log.Logger
+	// VaultErr is non-nil when the master key did not match the vault at
+	// unlock. The server still serves discovery and listing, but the
+	// value-consuming Tools report this error.
+	VaultErr error
 }
 
 // Server is the BlindEnv MCP server.

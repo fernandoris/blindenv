@@ -369,3 +369,91 @@ func TestOpenCurrentAllocationsBounded(t *testing.T) {
 	}
 	t.Logf("open-current allocs = %.0f", allocs)
 }
+
+// seedVerifyStore opens a vault with a fixed, matching key and seeds n sensitive
+// definitions, for the unlock-verification benchmarks.
+func seedVerifyStore(tb testing.TB, n int) *Store {
+	tb.Helper()
+	key := make([]byte, crypto.KeySize)
+	path := filepath.Join(tb.TempDir(), "vault.db")
+	s, err := Open(path, key)
+	if err != nil {
+		tb.Fatalf("Open: %v", err)
+	}
+	tb.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+	if _, err := s.CreateProject(ctx, "my-api"); err != nil {
+		tb.Fatalf("CreateProject: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		if _, err := s.PutSecret(ctx, "my-api", "", fmt.Sprintf("KEY_%05d", i), fmt.Sprintf("value-%05d-abcdef", i)); err != nil {
+			tb.Fatalf("PutSecret: %v", err)
+		}
+	}
+	return s
+}
+
+// BenchmarkUnlockVerifyMatching measures the hot path: a matching key stops at
+// the first sensitive definition, so the cost is one AES-GCM decryption.
+func BenchmarkUnlockVerifyMatching(b *testing.B) {
+	ctx := context.Background()
+	s := seedVerifyStore(b, 200)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := s.VerifyMasterKey(ctx); err != nil {
+			b.Fatalf("VerifyMasterKey: %v", err)
+		}
+	}
+}
+
+// BenchmarkUnlockVerifyMismatch measures the failure path: no sensitive
+// definition decrypts, so every row is visited.
+func BenchmarkUnlockVerifyMismatch(b *testing.B) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "blindenv-bench-")
+	if err != nil {
+		b.Fatalf("temp dir: %v", err)
+	}
+	b.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "vault.db")
+	writeLegacyVault(b, path, 200)
+	s, err := Open(path, make([]byte, crypto.KeySize))
+	if err != nil {
+		b.Fatalf("Open: %v", err)
+	}
+	b.Cleanup(func() { _ = s.Close() })
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := s.VerifyMasterKey(ctx); err != ErrMasterKeyMismatch {
+			b.Fatalf("VerifyMasterKey: %v", err)
+		}
+	}
+}
+
+func unlockVerifyAllocs(t testing.TB, n int) float64 {
+	t.Helper()
+	s := seedVerifyStore(t, n)
+	ctx := context.Background()
+	return testing.AllocsPerRun(5, func() {
+		if err := s.VerifyMasterKey(ctx); err != nil {
+			t.Fatalf("VerifyMasterKey: %v", err)
+		}
+	})
+}
+
+// TestUnlockVerifyAllocationsBounded proves the matching-key verification stops
+// at the first success, so its allocations do not grow with the number of
+// definitions (rows are streamed, not buffered).
+func TestUnlockVerifyAllocationsBounded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("seeds a large vault")
+	}
+	small := unlockVerifyAllocs(t, 10)
+	large := unlockVerifyAllocs(t, 500)
+	t.Logf("unlock verify allocs: n=10 %.0f, n=500 %.0f", small, large)
+	if large > small*2+500 {
+		t.Fatalf("unlock verification allocations scaled with vault size: small=%.0f large=%.0f", small, large)
+	}
+}

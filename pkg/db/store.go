@@ -35,6 +35,12 @@ var (
 	// newer BlindEnv whose schema this build does not understand. The vault is
 	// left untouched.
 	ErrSchemaTooNew = errors.New("db: vault schema is newer than this build supports")
+	// ErrMasterKeyMismatch is returned when the vault has sensitive definitions
+	// but none of them can be decrypted with the provided master key.
+	ErrMasterKeyMismatch = errors.New("db: no sensitive value could be read with the current master key; check the passphrase or keyring, or whether the vault was written by another installation or version")
+	// ErrInconsistentDefinition is returned when a definition marked sensitive
+	// does not hold a valid ciphertext.
+	ErrInconsistentDefinition = errors.New("db: inconsistent definition")
 )
 
 func boolToInt(v bool) int {
@@ -119,6 +125,53 @@ func Open(path string, key []byte) (*Store, error) {
 
 // Close releases the underlying database handle.
 func (s *Store) Close() error { return s.db.Close() }
+
+// VerifyMasterKey checks that the master key can read the vault before any
+// value is served. If the vault has at least one sensitive definition, it
+// streams them and decrypts until the first success, so a matching key costs a
+// single decryption and memory does not grow with the number of definitions. It
+// returns ErrMasterKeyMismatch when sensitive definitions exist but none can be
+// decrypted, and ErrInconsistentDefinition when sensitive definitions exist but
+// none holds a valid ciphertext. A vault with no sensitive definitions always
+// verifies.
+func (s *Store) VerifyMasterKey(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT key, value_enc FROM secrets WHERE sensitive = 1`)
+	if err != nil {
+		return fmt.Errorf("db: query sensitive secrets: %w", err)
+	}
+	defer rows.Close()
+
+	hasSensitive := false
+	tested := false
+	for rows.Next() {
+		var (
+			key string
+			enc []byte
+		)
+		if err := rows.Scan(&key, &enc); err != nil {
+			return err
+		}
+		hasSensitive = true
+		if len(enc) < crypto.MinSealedSize {
+			continue
+		}
+		tested = true
+		if _, err := crypto.Decrypt(s.key, enc); err == nil {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	switch {
+	case !hasSensitive:
+		return nil
+	case tested:
+		return ErrMasterKeyMismatch
+	default:
+		return fmt.Errorf("%w: no sensitive definition holds a valid ciphertext", ErrInconsistentDefinition)
+	}
+}
 
 func nowString() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
@@ -459,9 +512,19 @@ func (s *Store) value(r resolvedSecret) (string, error) {
 	if !r.sensitive {
 		return r.plain, nil
 	}
-	plain, err := crypto.Decrypt(s.key, r.enc)
+	return s.decryptCiphertext(r.key, r.enc)
+}
+
+// decryptCiphertext opens a sensitive value's ciphertext. A blob too short to
+// be a valid AES-GCM ciphertext is rejected as an inconsistent definition
+// before the cipher is touched.
+func (s *Store) decryptCiphertext(key string, enc []byte) (string, error) {
+	if len(enc) < crypto.MinSealedSize {
+		return "", fmt.Errorf("%w %q: marked sensitive but has no valid ciphertext", ErrInconsistentDefinition, key)
+	}
+	plain, err := crypto.Decrypt(s.key, enc)
 	if err != nil {
-		return "", fmt.Errorf("db: decrypt %q: %w", r.key, err)
+		return "", fmt.Errorf("db: decrypt %q: %w", key, err)
 	}
 	return string(plain), nil
 }
@@ -614,11 +677,11 @@ func (s *Store) SetSecretMetadata(ctx context.Context, project, environment, key
 	}
 	var value string
 	if sensitive != 0 {
-		v, derr := crypto.Decrypt(s.key, enc)
+		v, derr := s.decryptCiphertext(key, enc)
 		if derr != nil {
-			return fmt.Errorf("db: decrypt %q: %w", key, derr)
+			return derr
 		}
-		value = string(v)
+		value = v
 	} else {
 		value = plain.String
 	}
@@ -704,10 +767,22 @@ func (s *Store) ResolveDetailed(ctx context.Context, project, environment string
 		return nil, err
 	}
 	out := make(map[string]ResolvedSecret, len(effective))
+	sensitive := 0
+	cryptoFailures := 0
+	var firstErr error
 	for key, r := range effective {
+		if r.sensitive {
+			sensitive++
+		}
 		value, err := s.value(r)
 		if err != nil {
-			return nil, err
+			if !errors.Is(err, ErrInconsistentDefinition) {
+				cryptoFailures++
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
 		}
 		out[key] = ResolvedSecret{
 			Key:         key,
@@ -719,6 +794,15 @@ func (s *Store) ResolveDetailed(ctx context.Context, project, environment string
 			Environment: r.env,
 			Overrides:   r.shadowed,
 		}
+	}
+	if firstErr != nil {
+		// Every sensitive definition failing cryptographically means the master
+		// key does not match the vault. A structural failure is a data problem
+		// and is reported as itself.
+		if sensitive > 0 && cryptoFailures == sensitive {
+			return nil, ErrMasterKeyMismatch
+		}
+		return nil, firstErr
 	}
 	return out, nil
 }
@@ -849,11 +933,11 @@ func (s *Store) ScopeEntries(ctx context.Context, project, environment string) (
 			Hint:      hint,
 		}
 		if entry.Sensitive {
-			dec, derr := crypto.Decrypt(s.key, enc)
+			dec, derr := s.decryptCiphertext(key, enc)
 			if derr != nil {
-				return nil, fmt.Errorf("db: decrypt %q: %w", key, derr)
+				return nil, derr
 			}
-			entry.Value = string(dec)
+			entry.Value = dec
 		} else {
 			entry.Value = plain.String
 		}

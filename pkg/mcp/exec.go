@@ -44,6 +44,9 @@ func (s *Server) handleExecute(ctx context.Context, req mcp.CallToolRequest) (*m
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	if res := s.vaultUnavailable(); res != nil {
+		return res, nil
+	}
 	command := req.GetString("command", "")
 	if command == "" {
 		return mcp.NewToolResultError("command is required"), nil

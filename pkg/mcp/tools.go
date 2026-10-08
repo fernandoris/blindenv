@@ -78,6 +78,16 @@ func openTool() mcp.Tool {
 	)
 }
 
+// vaultUnavailable returns a tool error when the master key did not match the
+// vault at unlock. Only the value-consuming Tools call it; discovery and
+// listing keep working without the key.
+func (s *Server) vaultUnavailable() *mcp.CallToolResult {
+	if s.cfg.VaultErr == nil {
+		return nil
+	}
+	return mcp.NewToolResultError(s.cfg.VaultErr.Error())
+}
+
 func (s *Server) handleListSecretKeys(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	project, environment, err := s.resolveContext(req.GetString("project", ""), req.GetString("environment", ""))
 	if err != nil {
@@ -163,6 +173,9 @@ func (s *Server) handleGetContext(ctx context.Context, req mcp.CallToolRequest) 
 	project, environment, err := s.resolveContext(req.GetString("project", ""), req.GetString("environment", ""))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if res := s.vaultUnavailable(); res != nil {
+		return res, nil
 	}
 	proj, err := s.cfg.Store.GetProject(ctx, project)
 	if err != nil {

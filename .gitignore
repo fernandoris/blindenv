@@ -4,6 +4,7 @@
 # Build output
 /blindenv
 /blindenv.exe
+/bin/
 
 # Local vaults and backups
 *.db

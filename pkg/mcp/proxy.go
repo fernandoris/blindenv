@@ -97,6 +97,9 @@ func (s *Server) handleProxy(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	if res := s.vaultUnavailable(); res != nil {
+		return res, nil
+	}
 	target := req.GetString("url", "")
 	if target == "" {
 		return mcp.NewToolResultError("url is required"), nil

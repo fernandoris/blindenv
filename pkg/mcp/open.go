@@ -63,6 +63,9 @@ func (s *Server) handleOpen(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	if res := s.vaultUnavailable(); res != nil {
+		return res, nil
+	}
 	urlTemplate := req.GetString("url", "")
 	if urlTemplate == "" {
 		return mcp.NewToolResultError("url is required"), nil

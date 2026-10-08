@@ -92,8 +92,13 @@ Environment:
 }
 
 func printVersion(w *os.File) {
+	b := version.Resolve()
+	commit := b.Commit
+	if b.Modified {
+		commit += " (modified)"
+	}
 	fmt.Fprintf(w, "blindenv %s (commit %s, built %s, %s %s/%s, %s)\n",
-		version.Version, version.Commit, version.Date,
+		b.Version, commit, b.Date,
 		runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.Compiler)
 }
 
