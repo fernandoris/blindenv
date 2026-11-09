@@ -102,8 +102,11 @@ func Open(path string, key []byte) (*Store, error) {
 	if len(key) != crypto.KeySize {
 		return nil, fmt.Errorf("db: master key must be %d bytes, got %d", crypto.KeySize, len(key))
 	}
+	// Acquire write transactions immediately so the read-modify-write update
+	// cannot fail with SQLITE_BUSY_SNAPSHOT when another process commits.
 	dsn := "file:" + path +
-		"?_pragma=busy_timeout(10000)" +
+		"?_txlock=immediate" +
+		"&_pragma=busy_timeout(10000)" +
 		"&_pragma=journal_mode(WAL)" +
 		"&_pragma=foreign_keys(1)"
 	sqlDB, err := sql.Open("sqlite", dsn)
@@ -701,9 +704,100 @@ func (s *Store) SetSecretMetadata(ctx context.Context, project, environment, key
 	return s.writeSecret(ctx, pid, env, key, value, meta)
 }
 
+// UpdateSecret updates an existing definition's value and metadata in place.
+// A nil value keeps the stored value and a nil meta keeps the stored metadata.
+// The definition must already exist in the requested scope; an update never
+// creates one. It returns true when the effective value is shorter than
+// MinSecretLength.
+func (s *Store) UpdateSecret(ctx context.Context, project, environment, key string, value *string, meta *SecretMeta) (bool, error) {
+	if strings.TrimSpace(key) == "" {
+		return false, ErrInvalidName
+	}
+	if value != nil && *value == "" {
+		return false, fmt.Errorf("%w: value must not be empty", ErrInvalidMetadata)
+	}
+	pid, env, err := s.resolveScope(ctx, project, environment)
+	if err != nil {
+		return false, err
+	}
+	where, wargs := s.scopeWhere(pid, env)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("db: begin secret update: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var (
+		enc       []byte
+		plain     sql.NullString
+		sensitive int
+		kind      string
+		hint      string
+	)
+	selectArgs := append(append([]any{}, wargs...), key)
+	err = tx.QueryRowContext(ctx,
+		`SELECT value_enc, value_plain, sensitive, kind, hint FROM secrets WHERE `+where+` AND key = ?`, selectArgs...).
+		Scan(&enc, &plain, &sensitive, &kind, &hint)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("%w: %q", ErrSecretNotFound, key)
+	}
+	if err != nil {
+		return false, fmt.Errorf("db: get secret for update: %w", err)
+	}
+
+	effectiveValue := ""
+	if value != nil {
+		effectiveValue = *value
+	} else if sensitive != 0 {
+		effectiveValue, err = s.decryptCiphertext(key, enc)
+		if err != nil {
+			return false, err
+		}
+	} else {
+		effectiveValue = plain.String
+	}
+
+	existingSensitive := sensitive != 0
+	effectiveMeta := SecretMeta{
+		Kind:      normalizeKind(kind),
+		Hint:      hint,
+		Sensitive: &existingSensitive,
+	}
+	if meta != nil {
+		effectiveMeta = *meta
+	}
+	effectiveMeta, err = normalizeMeta(effectiveMeta)
+	if err != nil {
+		return false, err
+	}
+	if err := validateHint(effectiveMeta, effectiveValue); err != nil {
+		return false, err
+	}
+	if err := s.writeSecretWith(ctx, tx, pid, env, key, effectiveValue, effectiveMeta); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("db: commit secret update: %w", err)
+	}
+	return len(effectiveValue) < MinSecretLength, nil
+}
+
+// dbExecer is the subset of *sql.DB and *sql.Tx used to write a definition, so
+// an update can run its read and write in one transaction.
+type dbExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 // writeSecret upserts a definition into exactly one scope, choosing the
 // encrypted or cleartext column from the metadata's sensitivity.
 func (s *Store) writeSecret(ctx context.Context, pid *int64, env, key, value string, meta SecretMeta) error {
+	return s.writeSecretWith(ctx, s.db, pid, env, key, value, meta)
+}
+
+// writeSecretWith upserts a definition using the supplied executor, allowing
+// the caller to run the write inside a transaction.
+func (s *Store) writeSecretWith(ctx context.Context, ex dbExecer, pid *int64, env, key, value string, meta SecretMeta) error {
 	sensitive := meta.IsSensitive()
 	var (
 		enc   = []byte{}
@@ -723,7 +817,7 @@ func (s *Store) writeSecret(ctx context.Context, pid *int64, env, key, value str
 
 	updateArgs := append([]any{enc, plain, boolToInt(sensitive), string(meta.Kind), meta.Hint, now}, wargs...)
 	updateArgs = append(updateArgs, key)
-	res, err := s.db.ExecContext(ctx,
+	res, err := ex.ExecContext(ctx,
 		`UPDATE secrets SET value_enc = ?, value_plain = ?, sensitive = ?, kind = ?, hint = ?, updated_at = ? WHERE `+where+` AND key = ?`, updateArgs...)
 	if err != nil {
 		return fmt.Errorf("db: update secret: %w", err)
@@ -736,13 +830,13 @@ func (s *Store) writeSecret(ctx context.Context, pid *int64, env, key, value str
 		if env != "" {
 			envArg = env
 		}
-		_, err = s.db.ExecContext(ctx,
+		_, err = ex.ExecContext(ctx,
 			`INSERT INTO secrets (project_id, environment, key, value_enc, value_plain, sensitive, kind, hint, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			pidArg, envArg, key, enc, plain, boolToInt(sensitive), string(meta.Kind), meta.Hint, now, now)
 		if err != nil {
 			if isUniqueViolation(err) {
-				if _, uerr := s.db.ExecContext(ctx,
+				if _, uerr := ex.ExecContext(ctx,
 					`UPDATE secrets SET value_enc = ?, value_plain = ?, sensitive = ?, kind = ?, hint = ?, updated_at = ? WHERE `+where+` AND key = ?`, updateArgs...); uerr != nil {
 					return fmt.Errorf("db: update secret after conflict: %w", uerr)
 				}

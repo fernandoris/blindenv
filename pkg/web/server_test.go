@@ -327,4 +327,102 @@ func TestPatchSharedSecretMetadataViaAPI(t *testing.T) {
 	}
 }
 
+func TestPatchSecretValueViaAPI(t *testing.T) {
+	_, store, mux := newTestWeb(t)
+	ctx := context.Background()
+	_, _ = store.CreateProject(ctx, "my-api")
+	_, _ = store.CreateEnvironment(ctx, "my-api", "staging")
+	_, _ = store.PutSecretMeta(ctx, "my-api", "staging", "API_KEY", "sk-live-original-123456", db.SecretMeta{
+		Kind: db.KindToken, Hint: "rotated monthly",
+	})
+
+	body := `{"environment":"staging","key":"API_KEY","value":"sk-live-rotated-987654","type":"token","hint":"rotated monthly","sensitive":true}`
+	w := do(t, mux, http.MethodPatch, "/api/projects/my-api/secrets", body, testToken, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("patch status = %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "sk-live-rotated-987654") {
+		t.Fatalf("patch response leaked the value: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"short":false`) {
+		t.Fatalf("patch response missing short flag: %s", w.Body.String())
+	}
+
+	reveal := do(t, mux, http.MethodPost, "/api/projects/my-api/secrets/reveal", `{"environment":"staging","key":"API_KEY"}`, testToken, "")
+	if reveal.Code != http.StatusOK || !strings.Contains(reveal.Body.String(), "sk-live-rotated-987654") {
+		t.Fatalf("value not updated: %d %s", reveal.Code, reveal.Body.String())
+	}
+	infos, err := store.ScopeSecrets(ctx, "my-api", "staging")
+	if err != nil {
+		t.Fatalf("ScopeSecrets: %v", err)
+	}
+	if len(infos) != 1 || infos[0].Kind != db.KindToken || infos[0].Hint != "rotated monthly" || !infos[0].Sensitive {
+		t.Fatalf("metadata not preserved: %+v", infos)
+	}
+}
+
+func TestPatchSharedSecretValueViaAPI(t *testing.T) {
+	_, store, mux := newTestWeb(t)
+	ctx := context.Background()
+	_, _ = store.PutSecretMeta(ctx, "", "staging", "ENDPOINT", "https://old.example.com/v3", db.SecretMeta{
+		Kind: db.KindURL, Hint: "shared base", Sensitive: boolPtr(false),
+	})
+
+	body := `{"environment":"staging","key":"ENDPOINT","value":"https://new.example.com/v3","type":"url","hint":"shared base","sensitive":false}`
+	w := do(t, mux, http.MethodPatch, "/api/shared/secrets", body, testToken, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("patch status = %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "https://new.example.com/v3") {
+		t.Fatalf("patch response leaked the value: %s", w.Body.String())
+	}
+
+	reveal := do(t, mux, http.MethodPost, "/api/shared/secrets/reveal", `{"environment":"staging","key":"ENDPOINT"}`, testToken, "")
+	if reveal.Code != http.StatusOK || !strings.Contains(reveal.Body.String(), "https://new.example.com/v3") {
+		t.Fatalf("shared value not updated: %d %s", reveal.Code, reveal.Body.String())
+	}
+	infos, err := store.ScopeSecrets(ctx, "", "staging")
+	if err != nil {
+		t.Fatalf("ScopeSecrets: %v", err)
+	}
+	if len(infos) != 1 || infos[0].Kind != db.KindURL || infos[0].Hint != "shared base" || infos[0].Sensitive {
+		t.Fatalf("shared metadata not preserved: %+v", infos)
+	}
+}
+
+func TestPatchSecretValueRequiresExistingDefinition(t *testing.T) {
+	_, store, mux := newTestWeb(t)
+	ctx := context.Background()
+	_, _ = store.CreateProject(ctx, "my-api")
+	_, _ = store.CreateEnvironment(ctx, "my-api", "staging")
+
+	body := `{"environment":"staging","key":"MISSING","value":"value-123456","type":"text","hint":"","sensitive":true}`
+	w := do(t, mux, http.MethodPatch, "/api/projects/my-api/secrets", body, testToken, "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("missing key status = %d, want 400", w.Code)
+	}
+	infos, err := store.ScopeSecrets(ctx, "my-api", "staging")
+	if err != nil {
+		t.Fatalf("ScopeSecrets: %v", err)
+	}
+	if len(infos) != 0 {
+		t.Fatalf("patch created a definition: %+v", infos)
+	}
+}
+
+func TestPatchSecretValueReportsShort(t *testing.T) {
+	_, store, mux := newTestWeb(t)
+	ctx := context.Background()
+	_, _ = store.PutSecret(ctx, "", "", "API_KEY", "long-enough-value")
+
+	body := `{"environment":"","key":"API_KEY","value":"short","type":"text","hint":"","sensitive":true}`
+	w := do(t, mux, http.MethodPatch, "/api/shared/secrets", body, testToken, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("patch status = %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"short":true`) {
+		t.Fatalf("short value not reported: %s", w.Body.String())
+	}
+}
+
 func boolPtr(v bool) *bool { return &v }

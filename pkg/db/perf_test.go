@@ -457,3 +457,72 @@ func TestUnlockVerifyAllocationsBounded(t *testing.T) {
 		t.Fatalf("unlock verification allocations scaled with vault size: small=%.0f large=%.0f", small, large)
 	}
 }
+
+// seedUpdateStore opens a vault with a fixed key, seeds n unrelated
+// definitions and one definition to rotate, for the update benchmarks.
+func seedUpdateStore(tb testing.TB, n int) *Store {
+	tb.Helper()
+	key := make([]byte, crypto.KeySize)
+	path := filepath.Join(tb.TempDir(), "vault.db")
+	s, err := Open(path, key)
+	if err != nil {
+		tb.Fatalf("Open: %v", err)
+	}
+	tb.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+	if _, err := s.CreateProject(ctx, "my-api"); err != nil {
+		tb.Fatalf("CreateProject: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		if _, err := s.PutSecret(ctx, "my-api", "", fmt.Sprintf("FILLER_%05d", i), fmt.Sprintf("value-%05d-abcdef", i)); err != nil {
+			tb.Fatalf("PutSecret: %v", err)
+		}
+	}
+	if _, err := s.PutSecret(ctx, "my-api", "", "ROTATE", "initial-value-0"); err != nil {
+		tb.Fatalf("PutSecret rotate: %v", err)
+	}
+	return s
+}
+
+// BenchmarkSecretValueUpdate measures an in-place value edit on a single
+// definition, so it should not depend on how many other definitions exist.
+func BenchmarkSecretValueUpdate(b *testing.B) {
+	ctx := context.Background()
+	s := seedUpdateStore(b, 50)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		value := fmt.Sprintf("rotated-value-%d", i)
+		if _, err := s.UpdateSecret(ctx, "my-api", "", "ROTATE", &value, nil); err != nil {
+			b.Fatalf("UpdateSecret: %v", err)
+		}
+	}
+}
+
+func updateAllocs(t testing.TB, n int) float64 {
+	t.Helper()
+	s := seedUpdateStore(t, n)
+	ctx := context.Background()
+	counter := 0
+	return testing.AllocsPerRun(5, func() {
+		counter++
+		value := fmt.Sprintf("rotated-value-%d", counter)
+		if _, err := s.UpdateSecret(ctx, "my-api", "", "ROTATE", &value, nil); err != nil {
+			t.Fatalf("UpdateSecret: %v", err)
+		}
+	})
+}
+
+// TestSecretUpdateAllocationsBounded proves an update touches one row, so its
+// allocations do not grow with the number of other definitions.
+func TestSecretUpdateAllocationsBounded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("seeds a large vault")
+	}
+	small := updateAllocs(t, 10)
+	large := updateAllocs(t, 1000)
+	t.Logf("secret update allocs: n=10 %.0f, n=1000 %.0f", small, large)
+	if large > small*2+2000 {
+		t.Fatalf("secret update allocations scaled with vault size: small=%.0f large=%.0f", small, large)
+	}
+}

@@ -196,13 +196,15 @@ type effectiveView struct {
 	Value     string `json:"value,omitempty"`
 }
 
-// secretMetaBody is the metadata-only PATCH payload for a definition.
+// secretMetaBody is the PATCH payload for a definition. Value is optional: when
+// absent the stored value is kept and only the metadata is updated.
 type secretMetaBody struct {
-	Environment string `json:"environment"`
-	Key         string `json:"key"`
-	Type        string `json:"type"`
-	Hint        string `json:"hint"`
-	Sensitive   *bool  `json:"sensitive"`
+	Environment string  `json:"environment"`
+	Key         string  `json:"key"`
+	Value       *string `json:"value"`
+	Type        string  `json:"type"`
+	Hint        string  `json:"hint"`
+	Sensitive   *bool   `json:"sensitive"`
 }
 
 func (b secretMetaBody) meta() db.SecretMeta {
@@ -493,11 +495,14 @@ func (s *server) handleProjectSub(w http.ResponseWriter, r *http.Request) {
 		if !readJSON(w, r, &body) {
 			return
 		}
-		if err := s.store.SetSecretMetadata(ctx, slug, body.Environment, strings.TrimSpace(body.Key), body.meta()); err != nil {
+		key := strings.TrimSpace(body.Key)
+		meta := body.meta()
+		short, err := s.store.UpdateSecret(ctx, slug, body.Environment, key, body.Value, &meta)
+		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"updated": strings.TrimSpace(body.Key)})
+		writeJSON(w, http.StatusOK, map[string]any{"updated": key, "short": short})
 
 	case len(parts) == 2 && parts[1] == "secrets" && r.Method == http.MethodDelete:
 		environment := r.URL.Query().Get("environment")
@@ -561,11 +566,14 @@ func (s *server) handleShared(w http.ResponseWriter, r *http.Request) {
 		if !readJSON(w, r, &body) {
 			return
 		}
-		if err := s.store.SetSecretMetadata(ctx, "", body.Environment, strings.TrimSpace(body.Key), body.meta()); err != nil {
+		key := strings.TrimSpace(body.Key)
+		meta := body.meta()
+		short, err := s.store.UpdateSecret(ctx, "", body.Environment, key, body.Value, &meta)
+		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"updated": strings.TrimSpace(body.Key)})
+		writeJSON(w, http.StatusOK, map[string]any{"updated": key, "short": short})
 
 	case rest == "secrets" && r.Method == http.MethodDelete:
 		environment := r.URL.Query().Get("environment")

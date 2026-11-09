@@ -430,3 +430,49 @@ INSERT INTO environments (project_id, name, created_at) VALUES (1, 'staging', 't
 		t.Fatalf("restored value = %q", got2["API_KEY"])
 	}
 }
+
+// TestCompatLegacyVaultEditableAfterMigration verifies that a vault written by
+// an older schema can be opened, migrated and then edited in place.
+func TestCompatLegacyVaultEditableAfterMigration(t *testing.T) {
+	key := testKey(t)
+	path := filepath.Join(t.TempDir(), "vault.db")
+	seedRaw(t, path, seedV1)
+
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	enc, err := crypto.Encrypt(key, []byte("legacy-secret-123"))
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	if _, err := raw.Exec(
+		`INSERT INTO secrets (project_id, environment_id, key, value_enc, created_at, updated_at) VALUES (1, 1, 'API_KEY', ?, 't', 't')`, enc); err != nil {
+		t.Fatalf("seed legacy secret: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	s, err := Open(path, key)
+	if err != nil {
+		t.Fatalf("Open migrated: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	short, err := s.UpdateSecret(ctx, "my-api", "staging", "API_KEY", strPtr("rotated-secret-456"), nil)
+	if err != nil {
+		t.Fatalf("UpdateSecret: %v", err)
+	}
+	if short {
+		t.Fatalf("long replacement reported as short")
+	}
+	got, err := s.Resolve(ctx, "my-api", "staging")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got["API_KEY"] != "rotated-secret-456" {
+		t.Fatalf("edited value = %q", got["API_KEY"])
+	}
+}

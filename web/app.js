@@ -592,7 +592,7 @@ function secretRow(s, current) {
       if (revealedNow) actions.appendChild(copyButton(revealed[rid]));
     }
     const edit = el(`<button type="button" class="ml-2 rounded px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600">edit</button>`);
-    edit.onclick = () => openMetaEditor(s, target);
+    edit.onclick = () => openEditSecret(s, target, rid);
     actions.appendChild(edit);
     const del = el(`<button type="button" class="ml-2 rounded px-2 py-0.5 text-xs bg-rose-800 hover:bg-rose-700">delete</button>`);
     del.onclick = () => requestDelete(s, target);
@@ -790,18 +790,22 @@ function createSecret(target, key, value, meta) {
   });
 }
 
-function patchSecret(target, key, meta) {
+function patchSecret(target, key, meta, value) {
   const payload = Object.assign({ environment: target.environment, key }, meta);
+  if (value !== undefined) payload.value = value;
   const path = target.project ? `/api/projects/${enc(target.project)}/secrets` : "/api/shared/secrets";
   return api(path, { method: "PATCH", body: JSON.stringify(payload) });
 }
 
-function openMetaEditor(secret, target) {
+function openEditSecret(secret, target, rid) {
   const root = document.getElementById("modal-root");
   const overlay = el(`<div class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-4">
-    <div role="dialog" aria-modal="true" aria-label="Edit metadata" class="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-5">
-      <h2 class="mb-1 text-base font-semibold">Edit ${esc(secret.key)}</h2>
-      <p class="mb-3 text-xs text-slate-400">Only the metadata changes; the value is untouched.</p>
+    <div role="dialog" aria-modal="true" aria-labelledby="edit-secret-title" class="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-5">
+      <h2 id="edit-secret-title" class="mb-1 text-base font-semibold">Edit ${esc(secret.key)}</h2>
+      <p class="mb-3 text-xs text-slate-400">Change the metadata or replace the value. The current value is never shown.</p>
+      <label for="edit-secret-value" class="block text-xs text-slate-400">New value (optional)</label>
+      <input id="edit-secret-value" name="value" type="password" autocomplete="new-password" aria-describedby="edit-secret-value-help" placeholder="Leave blank to keep the current value" class="mt-1 w-full rounded bg-slate-800 px-2 py-1 text-sm ring-1 ring-slate-700 focus:ring-sky-500" />
+      <p id="edit-secret-value-help" class="mt-1 text-xs text-slate-500">Leave this blank to keep the current value.</p>
       <div class="meta-slot"></div>
       <div class="mt-4 flex justify-end gap-2">
         <button type="button" data-cancel class="rounded bg-slate-700 px-3 py-1.5 text-sm hover:bg-slate-600">Cancel</button>
@@ -815,8 +819,24 @@ function openMetaEditor(secret, target) {
   overlay.querySelector("[data-cancel]").onclick = close;
   overlay.querySelector("[data-save]").onclick = () => {
     const m = readMeta(meta);
+    const raw = overlay.querySelector("#edit-secret-value").value;
+    const value = raw === "" ? undefined : raw;
     close();
-    action(() => patchSecret(target, secret.key, m));
+    action(async () => {
+      const res = await patchSecret(target, secret.key, m, value);
+      if (value !== undefined && rid) {
+        delete revealed[rid];
+        if (revealTimers[rid]) {
+          clearTimeout(revealTimers[rid]);
+          delete revealTimers[rid];
+        }
+      }
+      if (value !== undefined && res && res.short) {
+        toast(`"${secret.key}" is under 6 characters and will not be redacted from command output.`, "warning");
+      } else {
+        toast(`Updated "${secret.key}".`, "success");
+      }
+    });
   };
   overlay.onclick = (e) => {
     if (e.target === overlay) close();
@@ -826,6 +846,7 @@ function openMetaEditor(secret, target) {
   });
   root.innerHTML = "";
   root.appendChild(overlay);
+  overlay.querySelector("#edit-secret-value").focus();
 }
 
 function revealSecret(target, key) {
